@@ -1,0 +1,32 @@
+export interface WindowEnv {
+    /** Public API host: OAuth callbacks, webhooks, and the `apiURL` handed to the SDK / Connect UI. */
+    apiUrl: string;
+    /** Where the dashboard sends its own API requests. Equals `apiUrl` unless NANGO_DASHBOARD_API_URL is set. `/` means same-origin. */
+    dashboardApiUrl: string;
+    /** OAuth authorization-server issuer used by the browser consent API. */
+    oauthServerUrl: string | undefined;
+    publicUrl: string;
+    connectUrl: string;
+    gitHash: string | undefined;
+    environment: 'development' | 'staging' | 'production';
+    publicSentryKey: string;
+    publicPosthogKey: string;
+    publicPosthogHost: string;
+    publicLogoDevKey: string;
+    publicStripeKey: string;
+    publicPlainAppId: string;
+    isCloud: boolean;
+    isHosted: boolean;
+    isEnterprise: boolean;
+    features: {
+        logs: boolean;
+        scripts: boolean;
+        auth: boolean;
+        allowSignup: boolean;
+        managedAuth: boolean;
+        gettingStarted: boolean;
+        slack: boolean;
+        plan: boolean;
+        authRoles: boolean;
+    };
+}

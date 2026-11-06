@@ -1,0 +1,400 @@
+import type { ApiEndpoint, ApiError, ApiTimestamps } from '../api.js';
+import type { AuditPolicy } from '../audit-trail/event.js';
+import type { AuthModes, AuthModeType } from '../auth/api.js';
+import type { NangoSyncConfig } from '../flow/index.js';
+import type { FunctionListType } from '../functions/domain.js';
+import type { Provider } from '../providers/provider.js';
+import type { IntegrationConfig } from './db.js';
+import type { Merge } from 'type-fest';
+
+export type ApiPublicIntegration = Merge<
+    Pick<IntegrationConfig, 'created_at' | 'updated_at' | 'unique_key' | 'provider' | 'display_name' | 'forward_webhooks' | 'missing_fields'>,
+    ApiTimestamps
+> & {
+    logo: string;
+} & ApiPublicIntegrationInclude;
+export interface ApiPublicIntegrationInclude {
+    webhook_url?: string | null;
+    // Per-integration, non-secret overrides surfaced to the Connect UI (e.g. the API key field label).
+    // Derived server-side from a curated subset of the integration's `custom` config — never the whole object.
+    credentials_label?: Record<string, string> | undefined;
+    // Names of `credentials` fields already set at the integration level (via `integration_config`), so the
+    // Connect UI can skip asking end users for them. Presence only — never the underlying value.
+    preconfigured_credentials?: string[] | undefined;
+    // Names of `connection_config` fields already set at the integration level (via `integration_config`), so the
+    // Connect UI can skip asking end users for them. Presence only — never the underlying value.
+    preconfigured_connection_config?: string[] | undefined;
+    credentials?:
+        | {
+              type: AuthModes['OAuth2'] | AuthModes['OAuth1'] | AuthModes['TBA'];
+              client_id: string | null;
+              client_secret: string | null;
+              scopes: string | null;
+              webhook_secret: string | null;
+          }
+        | { type: AuthModes['App']; app_id: string | null; private_key: string | null; app_link: string | null }
+        | {
+              type: AuthModes['Custom'];
+              client_id: string | null;
+              client_secret: string | null;
+              app_id: string | null;
+              app_link: string | null;
+              private_key: string | null;
+          }
+        | {
+              type: AuthModes['MCP_OAUTH2_GENERIC'];
+              client_name: string | null;
+              client_uri: string | null;
+              client_logo_uri: string | null;
+          }
+        | { type: 'INTEGRATION_CONFIG'; auth_mode: AuthModeType; integration_config: Record<string, string> }
+        | {
+              type: AuthModes['MCP_OAUTH2'];
+              client_id: string | null;
+              client_secret: string | null;
+              scopes: string | null;
+          }
+        | null;
+}
+
+export type GetPublicListIntegrations = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'non-auditable' };
+    Method: 'GET';
+    Path: '/integrations';
+    Querystring?: { connect_session_token: string };
+    Success: {
+        data: ApiPublicIntegration[];
+    };
+}>;
+
+export type PostPublicIntegration = ApiEndpoint<{
+    Audit: AuditPolicy<'integration', 'created', 'environment'>;
+    Method: 'POST';
+    Path: '/integrations';
+    Body: {
+        provider: string;
+        unique_key: string;
+        display_name?: string | undefined;
+        forward_webhooks?: boolean | undefined;
+    } & (
+        | {
+              credentials?: ApiPublicIntegrationCredentials | undefined;
+              // Custom integration configuration (providers that declare `integration_config`, e.g. private-api-generic).
+              // Validated server-side against the provider schema and persisted to the `custom` column.
+              integration_config?: Record<string, string> | undefined;
+              // Free-form custom values, for providers without an `integration_config` schema.
+              custom?: Record<string, string> | undefined;
+          }
+        | {
+              credentials: { type: 'NANGO_MANAGED' };
+              integration_config?: never;
+              custom?: never;
+          }
+    );
+    Success: {
+        data: ApiPublicIntegration;
+    };
+}>;
+
+// TODO: remove this deprecated alias of POST /integrations with NANGO_MANAGED credentials (NAN-7880)
+export type PostPublicQuickstartIntegration = ApiEndpoint<{
+    Audit: AuditPolicy<'integration', 'created', 'environment'>;
+    Method: 'POST';
+    Path: '/integrations/quickstart';
+    Body: {
+        provider: string;
+        unique_key: string;
+        display_name?: string | undefined;
+        forward_webhooks?: boolean | undefined;
+    };
+    Success: {
+        data: ApiPublicIntegration;
+    };
+}>;
+
+export type GetPublicIntegration = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'non-auditable' };
+    Method: 'GET';
+    Path: '/integrations/:uniqueKey';
+    Params: { uniqueKey: string };
+    Querystring: { include?: ('webhook' | 'credentials')[] | undefined };
+    Success: { data: ApiPublicIntegration };
+}>;
+
+export type PatchPublicIntegration = ApiEndpoint<{
+    Audit: AuditPolicy<'integration', 'updated', 'environment'>;
+    Method: 'PATCH';
+    Path: '/integrations/:uniqueKey';
+    Params: { uniqueKey: string };
+    Body: {
+        unique_key?: string | undefined;
+        display_name?: string | undefined;
+        credentials?: ApiPublicIntegrationCredentials | undefined;
+        forward_webhooks?: boolean | undefined;
+        // Custom integration configuration (providers that declare `integration_config`, e.g. private-api-generic).
+        // Validated server-side against the provider schema and persisted to the `custom` column.
+        integration_config?: Record<string, string> | undefined;
+        // Free-form custom values, for providers without an `integration_config` schema.
+        custom?: Record<string, string> | undefined;
+    };
+    Success: {
+        data: ApiPublicIntegration;
+    };
+}>;
+
+export type DeletePublicIntegration = ApiEndpoint<{
+    Audit: AuditPolicy<'integration', 'deleted', 'environment'>;
+    Method: 'DELETE';
+    Path: '/integrations/:uniqueKey';
+    Params: { uniqueKey: string };
+    Success: { success: true };
+}>;
+
+export type GetPublicFunctionCode = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'non-auditable' };
+    Method: 'GET';
+    Path: '/integrations/:uniqueKey/functions/:name/code';
+    Params: {
+        uniqueKey: string;
+        name: string;
+    };
+    Querystring: {
+        type?: FunctionListType | undefined;
+    };
+    Success: {
+        type: FunctionListType;
+        code: string;
+    };
+    Error: ApiError<'not_found'>;
+}>;
+
+export type GetFunctionCode = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'non-auditable' };
+    Method: 'GET';
+    Path: '/api/v1/integrations/:providerConfigKey/functions/:functionName/code';
+    Params: {
+        providerConfigKey: string;
+        functionName: string;
+    };
+    Querystring: {
+        env: string;
+        type?: FunctionListType | undefined;
+    };
+    Success: {
+        type: FunctionListType;
+        code: string;
+    };
+    Error: ApiError<'not_found'>;
+}>;
+
+export type ApiIntegration = Omit<Merge<IntegrationConfig, ApiTimestamps>, 'oauth_client_secret_iv' | 'oauth_client_secret_tag'>;
+export type ApiIntegrationList = ApiIntegration & {
+    meta: {
+        authMode: AuthModeType;
+        scriptsCount: number;
+        connectionCount: number;
+        creationDate: string;
+        missingFieldsCount: number;
+        connectionConfigParams?: string[];
+        credentialParams?: string[];
+        assertionOptionParams?: string[];
+        authorizationParams?: Record<string, string>;
+        displayName: string;
+        requireClientCertificate?: boolean;
+        installation?: 'outbound';
+    };
+};
+
+export type GetIntegrations = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'non-auditable' };
+    Method: 'GET';
+    Path: '/api/v1/integrations';
+    Success: {
+        data: ApiIntegrationList[];
+    };
+}>;
+
+export interface OAuthAuthBody {
+    authType: Extract<AuthModeType, 'OAUTH1' | 'OAUTH2' | 'TBA'>;
+    clientId?: string | undefined;
+    clientSecret?: string | undefined;
+    scopes?: string | undefined;
+}
+
+export interface OAuth2CCAuthBody {
+    authType: Extract<AuthModeType, 'OAUTH2_CC'>;
+    scopes?: string | undefined;
+}
+
+export interface AppAuthBody {
+    authType: Extract<AuthModeType, 'APP'>;
+    appId?: string | undefined;
+    appLink?: string | undefined;
+    privateKey?: string | undefined;
+}
+
+export interface CustomAuthBody {
+    authType: Extract<AuthModeType, 'CUSTOM'>;
+    clientId?: string | undefined;
+    clientSecret?: string | undefined;
+    appId?: string | undefined;
+    appLink?: string | undefined;
+    privateKey?: string | undefined;
+}
+
+export interface MCPOAuth2AuthBody {
+    authType: Extract<AuthModeType, 'MCP_OAUTH2'>;
+    clientId?: string | undefined;
+    clientSecret?: string | undefined;
+    scopes?: string | undefined;
+}
+
+export interface MCPOAuth2GenericAuthBody {
+    authType: Extract<AuthModeType, 'MCP_OAUTH2_GENERIC'>;
+    clientName?: string | undefined;
+    clientUri?: string | undefined;
+    clientLogoUri?: string | undefined;
+    scopes?: string | undefined;
+}
+
+export interface InstallPluginAuthBody {
+    authType: Extract<AuthModeType, 'INSTALL_PLUGIN'>;
+    appLink?: string | undefined;
+    username?: string | undefined;
+    password?: string | undefined;
+}
+
+export type IntegrationAuthBody =
+    | OAuthAuthBody
+    | OAuth2CCAuthBody
+    | AppAuthBody
+    | CustomAuthBody
+    | MCPOAuth2AuthBody
+    | MCPOAuth2GenericAuthBody
+    | InstallPluginAuthBody;
+
+export type PostIntegration = ApiEndpoint<{
+    Audit: AuditPolicy<'integration', 'created', 'environment'>;
+    Method: 'POST';
+    Path: '/api/v1/integrations';
+    Querystring: { env: string };
+    Body: {
+        provider: string;
+        useSharedCredentials: boolean;
+        integrationId?: string | undefined;
+        webhookSecret?: string | undefined;
+        displayName?: string | undefined;
+        forward_webhooks?: boolean | undefined;
+        auth?: IntegrationAuthBody | undefined;
+        // Custom integration configuration (providers that declare `integration_config`, e.g. private-api-generic).
+        // Validated server-side against the provider schema and merged into `custom`.
+        integrationConfig?: Record<string, string> | undefined;
+    };
+    Success: {
+        data: ApiIntegration;
+    };
+}>;
+
+export type GetIntegration = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'non-auditable' };
+    Method: 'GET';
+    Path: '/api/v1/integrations/:providerConfigKey';
+    Querystring: { env: string };
+    Params: { providerConfigKey: string };
+    Success: {
+        data: {
+            integration: ApiIntegration;
+            template: Provider;
+            // Canonical templates-repo folder when the provider symlinks to another (e.g. `quickbooks-sandbox` → `quickbooks`); null otherwise.
+            symLinkTargetName: string | null;
+            meta: {
+                connectionsCount: number;
+                webhookUrl: string | null;
+                webhookSecret: string | null;
+            };
+        };
+    };
+}>;
+
+export type PatchIntegration = ApiEndpoint<{
+    Audit: AuditPolicy<'integration', 'updated', 'environment'>;
+    Method: 'PATCH';
+    Path: '/api/v1/integrations/:providerConfigKey';
+    Querystring: { env: string };
+    Params: { providerConfigKey: string };
+    Body:
+        | {
+              integrationId?: string | undefined;
+              webhookSecret?: string | undefined;
+              displayName?: string | undefined;
+              forward_webhooks?: boolean | undefined;
+              allow_unverified_webhooks?: boolean | undefined;
+              // Custom integration configuration (providers that declare `integration_config`, e.g. private-api-generic, aws-sigv4).
+              integrationConfig?: Record<string, string> | undefined;
+          }
+        | IntegrationAuthBody;
+    Success: {
+        data: {
+            success: boolean;
+        };
+    };
+}>;
+
+export type DeleteIntegration = ApiEndpoint<{
+    Audit: AuditPolicy<'integration', 'deleted', 'environment'>;
+    Method: 'DELETE';
+    Path: '/api/v1/integrations/:providerConfigKey';
+    Querystring: { env: string };
+    Params: { providerConfigKey: string };
+    Success: {
+        data: { success: boolean };
+    };
+}>;
+
+export type GetIntegrationFlows = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'non-auditable' };
+    Method: 'GET';
+    Path: '/api/v1/integrations/:providerConfigKey/flows';
+    Querystring: { env: string };
+    Params: { providerConfigKey: string };
+    Success: {
+        data: {
+            flows: NangoSyncConfig[];
+        };
+    };
+}>;
+
+export type ApiPublicIntegrationCredentials =
+    | {
+          type: Extract<AuthModeType, 'OAUTH1' | 'OAUTH2' | 'TBA'>;
+          client_id?: string | undefined;
+          client_secret?: string | undefined;
+          scopes?: string | undefined;
+          webhook_secret?: string | undefined;
+      }
+    | {
+          type: Extract<AuthModeType, 'APP'>;
+          app_id?: string | undefined;
+          app_link?: string | undefined;
+          private_key?: string | undefined;
+      }
+    | {
+          type: Extract<AuthModeType, 'CUSTOM'>;
+          client_id?: string | undefined;
+          client_secret?: string | undefined;
+          app_id?: string | undefined;
+          app_link?: string | undefined;
+          private_key?: string | undefined;
+      }
+    | {
+          type: Extract<AuthModeType, 'MCP_OAUTH2_GENERIC'>;
+          client_name?: string | undefined;
+          client_uri?: string | undefined;
+          client_logo_uri?: string | undefined;
+      }
+    | {
+          type: Extract<AuthModeType, 'MCP_OAUTH2'>;
+          client_id?: string | undefined;
+          client_secret?: string | undefined;
+          scopes?: string | undefined;
+      };

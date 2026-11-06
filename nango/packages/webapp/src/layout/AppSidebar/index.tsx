@@ -1,0 +1,137 @@
+import { ArrowUpRight, BarChart3, Blocks, Bot, Cog, List, Plug, Sprout, X } from 'lucide-react';
+import { useMemo } from 'react';
+import { Link, useLocation } from 'react-router-dom';
+
+import { AlertButtonLink } from '@/components/ui/AlertButtonLink';
+import {
+    Sidebar,
+    SidebarContent,
+    SidebarFooter,
+    SidebarGroup,
+    SidebarGroupContent,
+    SidebarHeader,
+    SidebarMenu,
+    SidebarMenuAction,
+    SidebarMenuButton,
+    SidebarMenuItem
+} from '@/components/ui/Sidebar';
+import { OverdueInvoiceAlert } from '@/features/Billing/OverdueInvoiceAlert';
+import { useMeta } from '@/hooks/useMeta';
+import { usePermissions } from '@/hooks/usePermissions';
+import { useApiGetOverdueInvoices, useCurrentPlan } from '@/hooks/usePlan';
+import { apiPatchUser } from '@/hooks/useUser';
+import { useStore } from '@/store';
+import { track } from '@/utils/analytics';
+import { EnvironmentDropdown } from './EnvironmentDropdown';
+import { ProfileDropdown } from './ProfileDropdown';
+import UsageLimitAlert from './UsageLimitAlert';
+
+import type { LucideIcon } from 'lucide-react';
+
+interface SidebarItem {
+    title: string;
+    url: string;
+    icon: LucideIcon;
+    exact?: boolean;
+    onClose?: () => Promise<void>;
+}
+
+export const AppSidebar: React.FC = () => {
+    const env = useStore((state) => state.env);
+    const { pathname } = useLocation();
+    const { data: metaData, refetch: refetchMeta } = useMeta();
+    const meta = metaData?.data;
+    const showGettingStarted = useStore((state) => state.showGettingStarted);
+    const { data: environmentData } = useCurrentPlan(env);
+    const plan = environmentData?.plan;
+    const { can } = usePermissions();
+    const showPlayground = Boolean(meta?.agentPlayground) && can('environment:agent_sessions:write');
+
+    const items = useMemo<SidebarItem[]>(() => {
+        const gettingStarted = {
+            title: 'Getting started',
+            url: `/${env}/getting-started`,
+            icon: Sprout,
+            onClose: async () => {
+                await apiPatchUser({
+                    gettingStartedClosed: true
+                });
+                void refetchMeta();
+            }
+        };
+
+        return [
+            meta && showGettingStarted && !meta.gettingStartedClosed ? gettingStarted : null,
+            showPlayground ? { title: 'Playground', url: `/${env}/playground`, icon: Bot } : null,
+            { title: 'Integrations', url: `/${env}/integrations`, icon: Blocks },
+            { title: 'Connections', url: `/${env}/connections`, icon: Plug },
+            { title: 'Logs', url: `/${env}/logs`, icon: List },
+            { title: 'Metrics', url: `/${env}`, icon: BarChart3, exact: true },
+            { title: 'Environment settings', url: `/${env}/environment-settings`, icon: Cog }
+        ].filter((item) => item !== null);
+    }, [env, meta, refetchMeta, showGettingStarted, showPlayground]);
+
+    // Only free accounts see the usage-limit alert. Paid accounts have no enforced caps, so it
+    // just adds noise and surfaces upgrade/downgrade inconsistencies (NAN-5959).
+    const showUsageAlert = plan?.name === 'free';
+
+    const canManageBilling = can('account:billing:payment_methods:create');
+    const { data: overdue } = useApiGetOverdueInvoices(env, plan);
+    const showOverdueAlert = Boolean(overdue?.data.hasOverdue);
+
+    return (
+        <Sidebar collapsible="none" className="border-r-[0.5px] border-border-default">
+            <SidebarHeader className="p-0">
+                <EnvironmentDropdown />
+            </SidebarHeader>
+            <SidebarContent className="pt-4">
+                <SidebarGroup className="p-0 px-2.5">
+                    <SidebarGroupContent>
+                        <SidebarMenu className="gap-0">
+                            {items.map((item) => (
+                                <SidebarMenuItem key={item.title}>
+                                    <SidebarMenuButton
+                                        asChild
+                                        data-active={pathname === item.url || (!item.exact && pathname.startsWith(`${item.url}/`))}
+                                        className="type-text-regular-sm gap-2.5 text-text-secondary [&>svg]:size-4!"
+                                    >
+                                        <Link to={item.url}>
+                                            <item.icon />
+                                            <span>{item.title}</span>
+                                        </Link>
+                                    </SidebarMenuButton>
+                                    {item.onClose && (
+                                        <SidebarMenuAction
+                                            onClick={item.onClose}
+                                            aria-label={`Close ${item.title}`}
+                                            className="text-icon-secondary hover:bg-transparent hover:text-icon-default"
+                                        >
+                                            <X />
+                                        </SidebarMenuAction>
+                                    )}
+                                </SidebarMenuItem>
+                            ))}
+                        </SidebarMenu>
+                    </SidebarGroupContent>
+                </SidebarGroup>
+            </SidebarContent>
+            <SidebarFooter className="p-0">
+                {showOverdueAlert && (
+                    <div className="px-2.5 mb-4">
+                        <OverdueInvoiceAlert canManageBilling={canManageBilling}>
+                            <AlertButtonLink to="/team/billing" onClick={() => track('billing:overdue_alert_link_click', {})}>
+                                View billing <ArrowUpRight />
+                            </AlertButtonLink>
+                        </OverdueInvoiceAlert>
+                    </div>
+                )}
+                {showUsageAlert && (
+                    <div className="px-2.5 mb-6">
+                        <UsageLimitAlert />
+                    </div>
+                )}
+                <ProfileDropdown />
+            </SidebarFooter>
+        </Sidebar>
+    );
+};

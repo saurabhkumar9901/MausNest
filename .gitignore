@@ -1,0 +1,68 @@
+# Added by code-review-graph
+.code-review-graph/
+
+# Dependencies
+node_modules/
+node_modules/*
+.pnpm-store/
+.pnpm/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+!cloudflare/control-plane/.dev.vars.example
+deploy/.env
+deploy/podman/.env
+deploy/podman/.env.*
+!deploy/podman/.env.example
+
+# Build outputs
+dist/
+build/
+out/
+dist-electron/
+dist-native/
+dist-companion/
+dist-server/
+*.tsbuildinfo
+tsconfig.tsbuildinfo
+.vite/
+.vercel/
+.wrangler/
+*.local
+
+# Nango local data and generated integration artifacts
+nango-data/
+**/nango-data/*
+nango-integrations/
+integration-templates/**/.nango
+integration-templates/**/schema.ts
+integration-templates/**/models.ts
+
+# Temp / scratch / logs (root-scoped: nested `logs` dirs are source code)
+.tmpexp/
+.tmp/
+/temp/
+.omb-scratch/
+/logs/
+*.log
+/.context/
+
+# Release signing material
+*.jks
+*.keystore
+*.p12
+
+# OS / editor / tooling
+.DS_Store
+Thumbs.db
+.idea/
+.cursor/*.local.mdc
+.claude/settings.local.json
+CLAUDE.local.md
+.claude/worktrees/
+.worktrees/
+.pi/

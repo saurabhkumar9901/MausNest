@@ -1,0 +1,168 @@
+import crypto from 'node:crypto';
+
+import get from 'lodash-es/get.js';
+
+import { getFlags } from '@nangohq/feature-flags';
+import { accountService, connectionService, getProvider, NangoError } from '@nangohq/shared';
+import { Err, getLogger, Ok } from '@nangohq/utils';
+
+import { recordConnectionCreated } from '../hooks/auditConnection.js';
+import { connectionCreated as connectionCreatedHook } from '../hooks/hooks.js';
+import { safeCompare } from './signature.js';
+
+import type { InternalNango } from './internal-nango.js';
+import type { WebhookHandler } from './types.js';
+import type { Config } from '@nangohq/shared';
+import type { ConnectionConfig, ConnectionUpsertResponse, IntegrationConfig, ProviderGithubApp } from '@nangohq/types';
+import type { Result } from '@nangohq/utils';
+
+const logger = getLogger('Webhook.GithubAppOauth');
+
+function validate(integration: IntegrationConfig, headerSignature: string, rawBody: any): boolean {
+    const custom = integration.custom as Record<string, string>;
+    const private_key = custom['private_key'];
+    const decodedPrivateKey = private_key ? Buffer.from(private_key, 'base64').toString('ascii') : private_key;
+    const hash = `${custom['app_id']}${decodedPrivateKey}${integration.app_link}`;
+    const secret = crypto.createHash('sha256').update(hash).digest('hex');
+
+    const signature = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+
+    return safeCompare(`sha256=${signature}`, headerSignature);
+}
+
+const route: WebhookHandler = async (nango, headers, body, rawBody) => {
+    const signature = headers['x-hub-signature-256'];
+
+    // Verified before handleCreateWebhook, so an unsigned installation event cannot finalize a
+    // pending connection.
+    if (signature) {
+        const valid = validate(nango.integration, signature, rawBody);
+
+        if (!valid) {
+            logger.error('Github App webhook signature invalid. Exiting');
+            return Err(new NangoError('webhook_invalid_signature'));
+        }
+    } else {
+        const outcome = await nango.unverifiedOutcome((accountUuid) => getFlags().allowUnauthorizedGithubAppWebhook(accountUuid));
+        nango.markUnverified({ reason: 'github_app_missing_signature', remediation: 'Set the Nango webhook secret on the GitHub App' }, outcome);
+
+        if (outcome === 'rejected') {
+            logger.error('Github App webhook signature missing. Exiting', { configId: nango.integration.id });
+            return Err(new NangoError('webhook_missing_signature'));
+        }
+    }
+
+    if (get(body, 'action') === 'created') {
+        const createResult = await handleCreateWebhook(nango, body);
+        if (createResult.isErr()) {
+            return Err(createResult.error);
+        }
+    }
+
+    const response = await nango.executeScriptForWebhooks({
+        payload: body,
+        webhookHeaderValue: headers['x-github-event'] as string,
+        connectionIdentifier: 'installation.id',
+        propName: 'installation_id'
+    });
+    return Ok({
+        content: { status: 'success' },
+        statusCode: 200,
+        connectionIds: response?.connectionIds || [],
+        toForward: body
+    });
+};
+
+async function handleCreateWebhook(nango: InternalNango, body: any): Promise<Result<void, NangoError>> {
+    if (!get(body, 'requester.login')) {
+        return Ok(undefined);
+    }
+
+    const connections = await connectionService.findConnectionsByMultipleConnectionConfigValues(
+        { app_id: get(body, 'installation.app_id'), pending: true, handle: get(body, 'requester.login') },
+        nango.environment.id
+    );
+
+    if (!connections || connections.length === 0) {
+        logger.info('No connections found for app_id', get(body, 'installation.app_id'));
+        return Ok(undefined);
+    } else {
+        const accountContext = await accountService.getAccountContext({ environmentId: nango.environment.id });
+
+        if (!accountContext) {
+            logger.error('Environment or account not found');
+            return Ok(undefined);
+        }
+
+        const { environment, account } = accountContext;
+
+        const installationId = get(body, 'installation.id');
+        const [connection] = connections;
+
+        // if there is no matching connection or if the connection config already has an installation_id, exit
+        if (!connection || connection.connection_config['installation_id']) {
+            logger.error('no connection or existing installation_id');
+            return Err(new NangoError('webhook_no_connection_or_existing_installation_id'));
+        }
+
+        const provider = getProvider(nango.integration.provider);
+        if (!provider) {
+            logger.error('unknown provider');
+            return Err(new NangoError('webhook_unknown_provider'));
+        }
+
+        const activityLogId = connection.connection_config['pendingLog'];
+
+        delete connection.connection_config['pendingLog'];
+
+        const connectionConfig: ConnectionConfig = {
+            ...connection.connection_config,
+            installation_id: installationId
+        };
+
+        const logCtx = nango.logContextGetter.get({ id: activityLogId, accountId: account.id });
+
+        const connCreatedHook = (res: ConnectionUpsertResponse) => {
+            // A GitHub App installation: nobody called us, so there is no route middleware to record this.
+            void recordConnectionCreated({
+                operation: res.operation,
+                connectionId: res.connection.connection_id,
+                providerConfigKey: res.connection.provider_config_key,
+                account: { id: account.id, uuid: account.uuid },
+                environment: { uuid: environment.uuid, name: environment.name },
+                endUser: undefined,
+                auditAttribution: { kind: 'no-attribution', reason: 'provider webhook' }
+            });
+
+            void connectionCreatedHook(
+                {
+                    connection: res.connection,
+                    environment,
+                    account,
+                    auth_mode: 'APP',
+                    operation: res.operation,
+                    endUser: undefined // TODO fix this
+                },
+                account,
+                nango.integration,
+                nango.logContextGetter,
+                { initiateSync: true, runPostConnectionScript: false }
+            );
+        };
+
+        await connectionService.getAppCredentialsAndFinishConnection(
+            connection.connection_id,
+            nango.integration as Config,
+            provider as ProviderGithubApp,
+            connectionConfig,
+            logCtx,
+            connCreatedHook,
+            connection.tags
+        );
+        await logCtx.success();
+
+        return Ok(undefined);
+    }
+}
+
+export default route;

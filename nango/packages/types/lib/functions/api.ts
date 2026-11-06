@@ -1,0 +1,590 @@
+import type { ApiEndpoint, ApiError } from '../api.js';
+import type { AuditPolicy } from '../audit-trail/event.js';
+import type { FunctionCapabilities, FunctionLimits, FunctionRequires, FunctionTags, FunctionTriggerDefinition } from '../function/config.js';
+import type { ToolTags } from '../function/tool.js';
+import type { FunctionSource } from '../syncConfigs/db.js';
+import type { FunctionListType, FunctionType, ListedNangoFunction, NangoActionFunction, NangoFunctionTemplate, NangoSyncFunction } from './domain.js';
+import type { JSONSchema7 } from 'json-schema';
+
+export type RunnableFunctionType = Extract<FunctionType, 'action' | 'sync'>;
+
+export type FunctionErrorCode =
+    | 'invalid_request'
+    | 'server_error'
+    | 'integration_not_found'
+    | 'compilation_error'
+    | 'dryrun_error'
+    | 'deployment_error'
+    | 'connection_not_found'
+    | 'dryrun_not_found'
+    | 'deployment_not_found'
+    | 'function_disabled'
+    | 'execution_environment_unavailable'
+    | 'timeout'
+    | 'validation_error';
+
+export interface ProxyCall {
+    method: string;
+    endpoint: string;
+    status: number;
+    request: {
+        params?: Record<string, unknown>;
+        headers?: Record<string, unknown>;
+        data?: unknown;
+    };
+    response: unknown;
+    headers: Record<string, unknown>;
+}
+
+export interface FunctionCompileBody {
+    code: string;
+}
+
+export interface FunctionCompileSuccess {
+    bundle_size_bytes: number;
+    bundled_js: string;
+    compiled_at: string;
+}
+
+export interface FunctionDryrunBody {
+    integration_id: string;
+    function_type: RunnableFunctionType;
+    code: string;
+    connection_id: string;
+    input?: unknown;
+    metadata?: Record<string, unknown> | undefined;
+    checkpoint?: Record<string, unknown> | undefined;
+    last_sync_date?: string | undefined;
+}
+
+export type FunctionAsyncJobStatus = 'waiting' | 'running' | 'success' | 'failed';
+export type FunctionDryrunStatus = FunctionAsyncJobStatus;
+export type FunctionDeploymentStatus = FunctionAsyncJobStatus;
+
+export interface FunctionDryrunCreateSuccess {
+    id: string;
+    status: Extract<FunctionDryrunStatus, 'waiting' | 'running'>;
+    created_at: string;
+}
+
+export interface FunctionDryrunResultSuccess {
+    id: string;
+    status: FunctionDryrunStatus;
+    integration_id: string;
+    function_type: RunnableFunctionType;
+    created_at: string;
+    updated_at: string;
+    started_at?: string | undefined;
+    completed_at?: string | undefined;
+    duration_ms?: number | undefined;
+    output?: string | undefined;
+    result?: unknown;
+    error?: ApiError<FunctionErrorCode>['error'] | undefined;
+}
+
+export type FunctionDryrunResultBody =
+    | {
+          status: 'success';
+          output: string;
+          duration_ms?: number | undefined;
+      }
+    | {
+          status: 'failed';
+          output?: string | undefined;
+          duration_ms?: number | undefined;
+          error: {
+              code?: string | undefined;
+              message: string;
+              payload?: unknown;
+          };
+      };
+
+export interface FunctionDeploymentCodeBody {
+    type: 'function';
+    integration_id: string;
+    function_name: string;
+    function_type: RunnableFunctionType;
+    code: string;
+    version?: string | undefined;
+    allow_destructive?: boolean | undefined;
+}
+
+export interface FunctionDeploymentTemplateBody {
+    type: 'template';
+    integration_id: string;
+    template: string;
+    /** Optional; inferred from the template name unless a sync and an action share it. */
+    function_type?: RunnableFunctionType | undefined;
+}
+
+export interface FunctionDeploymentTemplateStoredRequest {
+    type: 'template';
+    integration_id: string;
+    template: string;
+    function_name: string;
+    function_type: RunnableFunctionType;
+}
+
+export type FunctionDeploymentBody = FunctionDeploymentCodeBody | FunctionDeploymentTemplateBody;
+
+export interface FunctionDeploymentCreateSuccess {
+    id: string;
+    // Async `function` deploys start at waiting/running; synchronous `template` deploys return a terminal success/failed.
+    status: FunctionDeploymentStatus;
+    created_at: string;
+}
+
+export interface FunctionDeploymentResultSuccess {
+    id: string;
+    status: FunctionDeploymentStatus;
+    integration_id: string;
+    function_name: string;
+    function_type: RunnableFunctionType;
+    created_at: string;
+    updated_at: string;
+    started_at?: string | undefined;
+    completed_at?: string | undefined;
+    duration_ms?: number | undefined;
+    deployed?: boolean | undefined;
+    deployed_functions?: { name: string; version: string }[] | undefined;
+    output?: string | undefined;
+    error?: ApiError<FunctionErrorCode>['error'] | undefined;
+}
+
+export type FunctionDeploymentResultBody =
+    | {
+          status: 'success';
+          output: string;
+          duration_ms?: number | undefined;
+      }
+    | {
+          status: 'failed';
+          output?: string | undefined;
+          duration_ms?: number | undefined;
+          error: {
+              code?: string | undefined;
+              message: string;
+              payload?: unknown;
+          };
+      };
+
+export type PostFunctionCompile = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'TODO: audit coverage pending' };
+    Method: 'POST';
+    Path: '/functions/compile';
+    Body: FunctionCompileBody;
+    Error: ApiError<FunctionErrorCode>;
+    Success: FunctionCompileSuccess;
+}>;
+
+export type PostFunctionDryrun = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'TODO: audit coverage pending' };
+    Method: 'POST';
+    Path: '/functions/dryruns';
+    Body: FunctionDryrunBody;
+    Error: ApiError<FunctionErrorCode>;
+    Success: FunctionDryrunCreateSuccess;
+}>;
+
+export type GetFunctionDryrun = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'non-auditable' };
+    Method: 'GET';
+    Path: '/functions/dryruns/:id';
+    Params: { id: string };
+    Error: ApiError<FunctionErrorCode>;
+    Success: FunctionDryrunResultSuccess;
+}>;
+
+export type PostFunctionDryrunResult = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'TODO: audit coverage pending' };
+    Method: 'POST';
+    Path: '/functions/dryruns/:id/result';
+    Params: { id: string };
+    Body: FunctionDryrunResultBody;
+    Error: ApiError<FunctionErrorCode>;
+    Success: { ok: true };
+}>;
+
+export type PostFunctionDeployment = ApiEndpoint<{
+    Audit: AuditPolicy<'function', 'deployed', 'environment'>;
+    Method: 'POST';
+    Path: '/functions/deployments';
+    Body: FunctionDeploymentBody;
+    Error: ApiError<FunctionErrorCode> | ApiError<'template_not_found' | 'ambiguous_function' | 'plan_limit' | 'template_already_deployed'>;
+    // Both variants return the same shape. `function` deploys are async (status waiting/running, poll for the result);
+    // `template` deploys run synchronously, so the response already carries a terminal status (success/failed).
+    Success: FunctionDeploymentCreateSuccess;
+}>;
+
+export type GetFunctionDeployment = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'non-auditable' };
+    Method: 'GET';
+    Path: '/functions/deployments/:id';
+    Params: { id: string };
+    Error: ApiError<FunctionErrorCode>;
+    Success: FunctionDeploymentResultSuccess;
+}>;
+
+export type PostFunctionDeploymentResult = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'TODO: audit coverage pending' };
+    Method: 'POST';
+    Path: '/functions/deployments/:id/result';
+    Params: { id: string };
+    Body: FunctionDeploymentResultBody;
+    Error: ApiError<FunctionErrorCode>;
+    Success: { ok: true };
+}>;
+
+export type FunctionInvocationType = 'wait' | 'no_wait';
+
+export interface GetFunctionResponse {
+    uuid: string;
+    integration_id: string;
+    provider: string;
+    name: string;
+    description: string;
+    tags: FunctionTags | ToolTags;
+    state: 'enabled' | 'disabled';
+    source: FunctionSource;
+    trigger: FunctionTriggerDefinition;
+    input_json_schema: JSONSchema7 | null;
+    output_json_schema: JSONSchema7 | null;
+    created_at: string;
+    updated_at: string;
+}
+
+export type GetFunction = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'non-auditable' };
+    Method: 'GET';
+    Path: '/functions/:uuid';
+    Params: { uuid: string };
+    Success: GetFunctionResponse;
+}>;
+
+export type PatchFunction = ApiEndpoint<{
+    Audit: AuditPolicy<'function', 'updated', 'environment'>;
+    Method: 'PATCH';
+    Path: '/functions/:uuid';
+    Params: { uuid: string };
+    Body: { state: 'enabled' | 'disabled' };
+    Success: GetFunctionResponse;
+}>;
+
+export interface GetFunctionsQuery {
+    integration?: string | undefined;
+    provider?: string | undefined;
+    state?: 'enabled' | 'disabled' | undefined;
+    'trigger.kind'?: FunctionTriggerDefinition['kind'] | undefined;
+    cursor?: string | undefined;
+    limit?: number | undefined;
+}
+
+export type GetFunctions = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'non-auditable' };
+    Method: 'GET';
+    Path: '/functions';
+    Querystring: GetFunctionsQuery;
+    Success: {
+        data: GetFunctionResponse[];
+        next_cursor: string | null;
+    };
+}>;
+
+export type FunctionInvocationErrorCode =
+    | 'function_failed'
+    | 'server_error'
+    | 'connection_not_found'
+    | 'function_not_found'
+    | 'function_disabled'
+    | 'validation_error'
+    | 'invalid_invocation';
+
+// Function output can be any json value or `{ id, statusUrl }`.
+// ApiEndpoint definition is not flexible enough to support any json value.
+// TODO: fix ApiEndpoint definition to support any json value
+type FunctionInvocationSuccess = any;
+
+export type PostFunctionInvocation = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'non-auditable' };
+    Method: 'POST';
+    Path: '/connections/:connectionId/functions/:functionUuid/invocations';
+    Params: { connectionId: string; functionUuid: string };
+    Body: {
+        input?: unknown | undefined;
+        invocation_type: FunctionInvocationType;
+        options?: Record<string, unknown> | undefined;
+    };
+    Error: ApiError<FunctionInvocationErrorCode | 'function_runtime_error'>;
+    Success: FunctionInvocationSuccess;
+}>;
+
+export type FunctionVariantErrorCode =
+    | 'invalid_variant'
+    | 'function_not_found'
+    | 'connection_not_found'
+    | 'function_disabled'
+    | 'function_variant_not_found'
+    | 'invalid_frequency'
+    | 'resource_capped'
+    | 'server_error';
+
+export type FunctionVariantSuccess = {
+    function: { uuid: string; name: string };
+    variant: string;
+    frequency: string;
+    state: 'enabled' | 'disabled';
+};
+
+export type PostFunctionVariant = ApiEndpoint<{
+    Audit: AuditPolicy<'function', 'variant_created', 'environment'>;
+    Method: 'POST';
+    Path: '/connections/:connectionId/functions/:functionUuid/variants';
+    Params: { connectionId: string; functionUuid: string };
+    Body: { variant: string };
+    Error: ApiError<FunctionVariantErrorCode>;
+    Success: FunctionVariantSuccess;
+}>;
+
+export type DeleteFunctionVariant = ApiEndpoint<{
+    Audit: AuditPolicy<'function', 'variant_deleted', 'environment'>;
+    Method: 'DELETE';
+    Path: '/connections/:connectionId/functions/:functionUuid/variants/:variant';
+    Params: { connectionId: string; functionUuid: string; variant: string };
+    Error: ApiError<FunctionVariantErrorCode>;
+    Success: { success: boolean };
+}>;
+
+export type PatchConnectionFunction = ApiEndpoint<{
+    Audit: AuditPolicy<'function', 'variant_updated', 'environment'>;
+    Method: 'PATCH';
+    Path: '/connections/:connectionId/functions/:functionUuid';
+    Params: { connectionId: string; functionUuid: string };
+    Body: PatchFunctionVariant['Body'];
+    Error: ApiError<FunctionVariantErrorCode>;
+    Success: FunctionVariantSuccess;
+}>;
+
+export type PatchFunctionVariant = ApiEndpoint<{
+    Audit: AuditPolicy<'function', 'variant_updated', 'environment'>;
+    Method: 'PATCH';
+    Path: '/connections/:connectionId/functions/:functionUuid/variants/:variant';
+    Params: { connectionId: string; functionUuid: string; variant: string };
+    Body: { enabled: boolean; frequency?: string | null } | { enabled?: boolean; frequency: string | null };
+    Error: ApiError<FunctionVariantErrorCode>;
+    Success: FunctionVariantSuccess;
+}>;
+
+export type GetFunctionInvocation = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'non-auditable' };
+    Method: 'GET';
+    Path: '/connections/:connectionId/functions/:functionUuid/invocations/:id';
+    Params: { connectionId: string; functionUuid: string; id: string };
+    Error: ApiError<
+        'invalid_uri_params' | 'not_found' | 'function_not_found' | 'connection_not_found' | 'function_failed' | 'function_runtime_error' | 'server_error'
+    >;
+    Success: FunctionInvocationSuccess;
+}>;
+
+// Shared between the private and public function-management endpoints. The two surfaces differ only in auth,
+// path, param names, and the `env` querystring (private) — the payloads and filters below are identical.
+export interface FunctionListFilters {
+    type?: FunctionListType;
+    search?: string;
+    page?: number;
+    limit?: number;
+}
+
+export interface FunctionListSuccess {
+    data: ListedNangoFunction[];
+    pagination: { total: number; page: number; limit: number };
+}
+
+export interface ListedFunctionSuccess {
+    data: ListedNangoFunction;
+}
+
+export interface FunctionDeletionSuccess {
+    data: { success: boolean };
+}
+
+export interface ProviderTemplatesSuccess {
+    data: (NangoSyncFunction | NangoActionFunction)[];
+}
+
+export type GetIntegrationFunctions = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'non-auditable' };
+    Method: 'GET';
+    Path: '/api/v1/integrations/:providerConfigKey/functions';
+    Querystring: { env: string } & FunctionListFilters;
+    Params: { providerConfigKey: string };
+    Success: FunctionListSuccess;
+}>;
+
+export type GetIntegrationFunction = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'non-auditable' };
+    Method: 'GET';
+    Path: '/api/v1/integrations/:providerConfigKey/functions/:functionName';
+    Querystring: { env: string; type?: FunctionListType };
+    Params: { providerConfigKey: string; functionName: string };
+    Success: ListedFunctionSuccess;
+}>;
+
+export type DeleteIntegrationFunction = ApiEndpoint<{
+    Audit: AuditPolicy<'function', 'deleted', 'environment'>;
+    Method: 'DELETE';
+    Path: '/api/v1/integrations/:providerConfigKey/functions/:functionName';
+    /** TODO: support deleting on-event functions */
+    Querystring: { env: string; type: RunnableFunctionType };
+    Params: { providerConfigKey: string; functionName: string };
+    Error: ApiError<'function_managed_by_deploy' | 'invalid_request'>;
+    Success: FunctionDeletionSuccess;
+}>;
+
+export type GetProviderTemplates = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'non-auditable' };
+    Method: 'GET';
+    Path: '/api/v1/providers/:providerConfigKey/templates';
+    Querystring: { env: string };
+    Params: { providerConfigKey: string };
+    Success: ProviderTemplatesSuccess;
+}>;
+
+export type GetPublicIntegrationFunctions = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'non-auditable' };
+    Method: 'GET';
+    Path: '/integrations/:uniqueKey/functions';
+    Querystring: FunctionListFilters;
+    Params: { uniqueKey: string };
+    Success: FunctionListSuccess;
+}>;
+
+export type GetPublicIntegrationFunction = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'non-auditable' };
+    Method: 'GET';
+    Path: '/integrations/:uniqueKey/functions/:name';
+    Querystring: { type?: FunctionListType };
+    Params: { uniqueKey: string; name: string };
+    Success: ListedFunctionSuccess;
+}>;
+
+export type DeletePublicIntegrationFunction = ApiEndpoint<{
+    Audit: AuditPolicy<'function', 'deleted', 'environment'>;
+    Method: 'DELETE';
+    Path: '/integrations/:uniqueKey/functions/:name';
+    /** TODO: support deleting on-event functions */
+    Querystring: { type: RunnableFunctionType };
+    Params: { uniqueKey: string; name: string };
+    Error: ApiError<'function_managed_by_deploy' | 'invalid_request'>;
+    Success: FunctionDeletionSuccess;
+}>;
+
+export type PostToolCall = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'data-plane operation' };
+    Method: 'POST';
+    Path: '/connections/:connectionId/tools/:name/calls';
+    Params: { connectionId: string; name: string };
+    Headers: { 'provider-config-key'?: string | undefined };
+    Body: {
+        input?: unknown | undefined;
+    };
+    Error: ApiError<FunctionInvocationErrorCode | 'function_runtime_error' | 'ambiguous_connection'>;
+    Success: FunctionInvocationSuccess;
+}>;
+
+export type GetPublicProviderTemplates = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'non-auditable' };
+    Method: 'GET';
+    Path: '/providers/:provider/templates';
+    Params: { provider: string };
+    Success: ProviderTemplatesSuccess;
+}>;
+
+type ProviderTemplateCodeError =
+    | ApiError<'unknown_function'>
+    | ApiError<'source_unavailable'>
+    | ApiError<'ambiguous_function', undefined, { matches: { type: FunctionType; name: string }[] }>;
+
+export type GetPublicProviderTemplateCode = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'non-auditable' };
+    Method: 'GET';
+    Path: '/providers/:provider/templates/:name/code';
+    Params: { provider: string; name: string };
+    Querystring: { type?: FunctionType | undefined };
+    Success: { type: FunctionType; code: string };
+    Error: ProviderTemplateCodeError;
+}>;
+
+export type GetProviderTemplateCode = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'non-auditable' };
+    Method: 'GET';
+    Path: '/api/v1/providers/:providerConfigKey/templates/:name/code';
+    Params: { providerConfigKey: string; name: string };
+    Querystring: { env: string; type?: FunctionType | undefined };
+    Success: { type: FunctionType; code: string };
+    Error: ProviderTemplateCodeError;
+}>;
+
+export type GetIntegrationTemplates = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'non-auditable' };
+    Method: 'GET';
+    Path: '/api/v1/integrations/:providerConfigKey/templates';
+    Querystring: { env: string };
+    Params: { providerConfigKey: string };
+    Success: { data: NangoFunctionTemplate[] };
+}>;
+
+export interface FunctionDeploymentArtifact {
+    name: string;
+    integrationId: string;
+    description: string;
+    tags?: FunctionTags | ToolTags | undefined;
+    trigger: FunctionTriggerDefinition;
+    requires: FunctionRequires;
+    capabilities: FunctionCapabilities;
+    limits: FunctionLimits;
+    input_schema_ref: string | null;
+    output_schema_ref: string | null;
+    model_schema_refs: string[];
+    metadata_schema_ref: string | null;
+    checkpoint_schema_ref: string | null;
+    json_schema: JSONSchema7;
+    fileBody: {
+        js: string;
+        ts: string;
+    };
+}
+
+export type FunctionReconciliationScope =
+    | { kind: 'environment' }
+    | { kind: 'integration'; integrationId: string }
+    | { kind: 'function'; integrationId: string; name: string };
+
+export interface FunctionDeploymentBundleBody {
+    reconciliationScope: FunctionReconciliationScope;
+    functions: FunctionDeploymentArtifact[];
+}
+
+export interface FunctionDeploymentBundleSuccess {
+    created: { integrationId: string; name: string }[];
+    updated: { integrationId: string; name: string }[];
+    unchanged: { integrationId: string; name: string }[];
+    deleted: { integrationId: string; name: string }[];
+}
+
+export type PostFunctionDeploymentBundlePreview = ApiEndpoint<{
+    Audit: { kind: 'no-audit'; reason: 'non-auditable' };
+    Method: 'POST';
+    Path: '/functions/deployments/bundle/preview';
+    Body: FunctionDeploymentBundleBody;
+    Error: ApiError<'functions_deployment_error' | 'integration_not_found'>;
+    Success: FunctionDeploymentBundleSuccess;
+}>;
+
+export type PostFunctionDeploymentBundle = ApiEndpoint<{
+    Audit: AuditPolicy<'function', 'deployed', 'environment'>;
+    Method: 'POST';
+    Path: '/functions/deployments/bundle';
+    Body: FunctionDeploymentBundleBody;
+    Error: ApiError<'functions_deployment_error' | 'concurrent_deployment' | 'integration_not_found'>;
+    Success: FunctionDeploymentBundleSuccess;
+}>;

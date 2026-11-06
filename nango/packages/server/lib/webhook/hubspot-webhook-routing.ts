@@ -1,0 +1,115 @@
+import crypto from 'node:crypto';
+
+import { NangoError } from '@nangohq/shared';
+import { Err, getLogger, metrics, Ok } from '@nangohq/utils';
+
+import { safeCompare } from './signature.js';
+
+import type { HubSpotWebhook, WebhookHandler } from './types.js';
+import type { IntegrationConfig } from '@nangohq/types';
+
+const logger = getLogger('Webhook.Hubspot');
+
+// Skip import events as they have the potential to overwhelm dispatch
+function isImportEvent(event: HubSpotWebhook): boolean {
+    return event.changeSource === 'IMPORT';
+}
+
+export function validate(integration: IntegrationConfig, headers: Record<string, any>, body: any): boolean {
+    const signature = headers['x-hubspot-signature'];
+    if (!signature || !integration.oauth_client_secret) {
+        return false;
+    }
+
+    const combinedSignature = `${integration.oauth_client_secret}${JSON.stringify(body)}`;
+    const createdHash = crypto.createHash('sha256').update(combinedSignature).digest('hex');
+
+    return safeCompare(createdHash, signature, 'hex');
+}
+
+const route: WebhookHandler<HubSpotWebhook | HubSpotWebhook[]> = async (nango, headers, body) => {
+    if (!nango.integration.oauth_client_secret) {
+        logger.error('missing client secret', { configId: nango.integration.id });
+        return Err(new NangoError('webhook_invalid_secret', { reason: 'No client secret configured' }));
+    }
+
+    if (!headers['x-hubspot-signature']) {
+        logger.error('missing signature', { configId: nango.integration.id });
+        return Err(new NangoError('webhook_missing_signature'));
+    }
+
+    const valid = validate(nango.integration, headers, body);
+
+    if (!valid) {
+        logger.error('webhook signature invalid');
+        return Err(new NangoError('webhook_invalid_signature'));
+    }
+
+    if (Array.isArray(body)) {
+        const nonImportEvents = body.filter((event) => !isImportEvent(event));
+        const skipped = body.length - nonImportEvents.length;
+        if (skipped > 0) {
+            metrics.increment(metrics.Types.WEBHOOK_INCOMING_SKIPPED, skipped, {
+                provider: nango.integration.provider,
+                reason: 'hubspot_import',
+                environmentId: nango.environment.id
+            });
+        }
+
+        const groupedByObjectId = nonImportEvents.reduce<Record<string, HubSpotWebhook[]>>((acc, event) => {
+            (acc[event.objectId] = acc[event.objectId] || []).push(event);
+            return acc;
+        }, {});
+
+        let connectionIds: string[] = [];
+
+        for (const objectId in groupedByObjectId) {
+            const events = groupedByObjectId[objectId];
+            if (!events) continue;
+
+            const sorted = events.sort((a: HubSpotWebhook, b: HubSpotWebhook) => {
+                const aIsCreation = a.subscriptionType.endsWith('.creation') ? 1 : 0;
+                const bIsCreation = b.subscriptionType.endsWith('.creation') ? 1 : 0;
+                return bIsCreation - aIsCreation || a.occurredAt - b.occurredAt;
+            });
+
+            for (const event of sorted) {
+                const response = await nango.executeScriptForWebhooks({
+                    payload: event,
+                    webhookType: 'subscriptionType',
+                    connectionIdentifier: 'portalId'
+                });
+                if (response && response.connectionIds?.length > 0) {
+                    connectionIds = connectionIds.concat(response.connectionIds);
+                }
+            }
+        }
+
+        // Deduplicate connection IDs to prevent multiple webhook forwards for the same connection
+        const uniqueConnectionIds = Array.from(new Set(connectionIds));
+        return Ok({ content: { status: 'success' }, statusCode: 200, connectionIds: uniqueConnectionIds, toForward: body });
+    } else {
+        if (isImportEvent(body)) {
+            metrics.increment(metrics.Types.WEBHOOK_INCOMING_SKIPPED, 1, {
+                provider: nango.integration.provider,
+                reason: 'hubspot_import',
+                environmentId: nango.environment.id
+            });
+            return Ok({ content: { status: 'success' }, statusCode: 200, connectionIds: [], toForward: body });
+        }
+
+        const response = await nango.executeScriptForWebhooks({
+            payload: body,
+            webhookType: 'subscriptionType',
+            connectionIdentifier: 'portalId'
+        });
+        return Ok({
+            content: { status: 'success' },
+            statusCode: 200,
+            connectionIds: response?.connectionIds || [],
+            toForward: body
+        });
+    }
+};
+
+export default route;

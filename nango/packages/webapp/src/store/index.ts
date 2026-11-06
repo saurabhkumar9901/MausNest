@@ -1,0 +1,71 @@
+import { MutationCache, QueryCache, QueryClient } from '@tanstack/react-query';
+import { create } from 'zustand';
+
+import { isNoSessionApiError } from '../utils/api';
+import { PROD_ENVIRONMENT_NAME } from '../utils/environments';
+import storage, { LocalStorageKeys } from '../utils/local-storage';
+import { signout } from '../utils/user';
+import { resetPlayground } from './playground';
+
+interface Env {
+    name: string;
+}
+
+interface State {
+    env: string;
+    envs: Env[];
+    baseUrl: string;
+    showGettingStarted: boolean;
+    debugMode: boolean;
+    setEnv: (value: string) => void;
+    setEnvs: (envs: Env[]) => void;
+    setBaseUrl: (value: string) => void;
+    setShowGettingStarted: (value: boolean) => void;
+    setDebugMode: (value: boolean) => void;
+}
+
+const initialEnv: unknown = storage.getItem(LocalStorageKeys.LastEnvironment);
+
+export const useStore = create<State>()((set, get) => ({
+    env: typeof initialEnv === 'string' && initialEnv ? initialEnv : 'dev',
+    envs: [{ name: 'dev' }, { name: PROD_ENVIRONMENT_NAME }],
+    baseUrl: 'https://api.nango.dev',
+    showGettingStarted: true,
+    debugMode: false,
+
+    setEnv: (value) => {
+        if (get().env !== value) {
+            resetPlayground();
+        }
+        set({ env: value });
+    },
+
+    setEnvs: (envs) => set({ envs }),
+
+    setBaseUrl: (value) => set({ baseUrl: value }),
+
+    setShowGettingStarted: (value) => set({ showGettingStarted: value }),
+
+    setDebugMode: (value) => set({ debugMode: value })
+}));
+
+function handleQueryError(error: unknown) {
+    if (isNoSessionApiError(error)) {
+        void signout({ expired: true });
+    }
+}
+
+export const queryClient = new QueryClient({
+    queryCache: new QueryCache({ onError: (error) => handleQueryError(error) }),
+    mutationCache: new MutationCache({ onError: (error) => handleQueryError(error) }),
+    defaultOptions: {
+        queries: {
+            refetchInterval: 0,
+            refetchOnWindowFocus: false,
+            refetchOnMount: true,
+            staleTime: 30 * 1000,
+            retry: 0,
+            retryDelay: (attemptIndex) => Math.min(2000 * 2 ** attemptIndex, 30000)
+        }
+    }
+});

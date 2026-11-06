@@ -1,0 +1,61 @@
+import { Trash2 } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
+
+import { Button } from '@nangohq/design-system';
+
+import { PermissionGate } from '@/components/patterns/PermissionGate.js';
+import { useConfirmDialog } from '@/hooks/useConfirmDialog.js';
+import { usePermissions } from '@/hooks/usePermissions.js';
+import { useDeleteIntegration } from '../../../../../hooks/useIntegration.js';
+import { useToast } from '../../../../../hooks/useToast.js';
+
+import type { ApiIntegration } from '@nangohq/types';
+
+export const DeleteIntegrationButton: React.FC<{ env: string; integration: ApiIntegration }> = ({ env, integration }) => {
+    const { toast } = useToast();
+    const navigate = useNavigate();
+
+    const { can } = usePermissions();
+    const canDeleteIntegration = can('environment:integrations:delete');
+
+    const { mutateAsync: deleteIntegration, isPending } = useDeleteIntegration(env, integration.unique_key);
+    const { confirm, DialogComponent } = useConfirmDialog();
+
+    const onDelete = async () => {
+        try {
+            await deleteIntegration();
+            toast({ title: `Integration "${integration.unique_key}" has been deleted`, variant: 'success' });
+            navigate(`/${env}/integrations`);
+        } catch {
+            toast({ title: 'Failed to delete integration', variant: 'error' });
+        }
+    };
+
+    return (
+        <>
+            <PermissionGate condition={canDeleteIntegration} asChild>
+                {(allowed) => (
+                    <Button
+                        variant="link-danger"
+                        loading={isPending}
+                        disabled={!allowed}
+                        onClick={() =>
+                            confirm({
+                                title: 'Delete integration?',
+                                description:
+                                    'You are about to permanently delete this integration, all of its associated connections and records. This operation is not reversible, are you sure you wish to continue?',
+                                confirmButtonText: 'Delete integration, connections and records',
+                                confirmVariant: 'danger',
+                                onConfirm: onDelete
+                            })
+                        }
+                    >
+                        <Trash2 />
+                        Delete
+                    </Button>
+                )}
+            </PermissionGate>
+            {DialogComponent}
+        </>
+    );
+};

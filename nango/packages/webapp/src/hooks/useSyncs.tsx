@@ -1,0 +1,107 @@
+import { useInfiniteQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+
+import { APIError, apiFetch } from '../utils/api';
+
+import type { RunSyncCommand } from '@/types';
+import type { GetConnectionSyncs } from '@nangohq/types';
+
+export const SYNCS_PAGE_SIZE = 50;
+
+interface UseSyncsArgs {
+    env: string;
+    connection_id: string;
+    provider_config_key: string;
+}
+
+async function fetchSyncs(usp: URLSearchParams): Promise<GetConnectionSyncs['Success']> {
+    const res = await apiFetch(`/api/v1/sync?${usp.toString()}`, { method: 'GET' });
+
+    const json = (await res.json()) as GetConnectionSyncs['Reply'];
+    if (!res.ok || 'error' in json) {
+        throw new APIError({ res, json });
+    }
+
+    return json;
+}
+
+export function useSyncs({ env, connection_id, provider_config_key }: UseSyncsArgs) {
+    return useInfiniteQuery<GetConnectionSyncs['Success'], APIError>({
+        queryKey: ['syncs', env, provider_config_key, connection_id],
+        queryFn: async ({ pageParam }) => {
+            const usp = new URLSearchParams();
+            usp.set('env', env);
+            usp.set('connection_id', connection_id);
+            usp.set('provider_config_key', provider_config_key);
+            usp.set('page', String(pageParam));
+            usp.set('limit', String(SYNCS_PAGE_SIZE));
+
+            return await fetchSyncs(usp);
+        },
+        getNextPageParam: (lastPage) => {
+            const { total, page, limit: pageLimit } = lastPage.pagination;
+            return (page + 1) * pageLimit < total ? page + 1 : undefined;
+        },
+        initialPageParam: 0,
+        enabled: Boolean(env && connection_id && provider_config_key),
+        refetchInterval: 5000
+    });
+}
+
+export async function fetchSyncByName({
+    env,
+    connection_id,
+    provider_config_key,
+    name,
+    variant = 'base'
+}: {
+    env: string;
+    connection_id: string;
+    provider_config_key: string;
+    name: string;
+    variant?: string;
+}) {
+    const usp = new URLSearchParams();
+    usp.set('env', env);
+    usp.set('connection_id', connection_id);
+    usp.set('provider_config_key', provider_config_key);
+    usp.set('name', name);
+    usp.set('variant', variant);
+    usp.set('limit', '1');
+
+    const json = await fetchSyncs(usp);
+    return json.data[0] ?? null;
+}
+
+export function useRunSyncCommand(env: string) {
+    const queryClient = useQueryClient();
+    return useMutation<
+        { res: Response; json: Record<string, unknown> },
+        APIError,
+        {
+            command: RunSyncCommand;
+            nango_connection_id: number;
+            sync_id: string;
+            sync_name: string;
+            sync_variant: string;
+            provider: string;
+            delete_records?: boolean;
+        }
+    >({
+        mutationFn: async (body) => {
+            const res = await apiFetch(`/api/v1/sync/command?env=${env}`, {
+                method: 'POST',
+                body: JSON.stringify(body)
+            });
+
+            const json = (await res.json()) as Record<string, unknown>;
+            if (!res.ok || 'error' in json) {
+                throw new APIError({ res, json });
+            }
+
+            return { res, json };
+        },
+        onSuccess: async () => {
+            await queryClient.invalidateQueries({ queryKey: ['syncs'] });
+        }
+    });
+}

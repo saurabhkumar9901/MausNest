@@ -1,0 +1,157 @@
+import * as z from 'zod';
+
+import { nanoid } from '@nangohq/utils';
+
+import { defaultOperationExpiration, envs } from '../env.js';
+import { indexOperations } from '../es/schema.js';
+
+import type { LogsStorageProvider } from '../storage/types.js';
+import type { estypes } from '@elastic/elasticsearch';
+import type { ConcatOperationList, MessageRow, OperationRow, OperationRowInsert, SearchOperationsType } from '@nangohq/types';
+import type { SetRequired } from 'type-fest';
+
+export const operationIdRegex = z.string().regex(/^[a-zA-Z0-9_]{20,25}$/);
+
+export interface AdditionalOperationData {
+    account?: { id: number; name: string };
+    environment?: { id: number; name: string } | undefined;
+    connection?: { id: number; name: string } | undefined;
+    integration?: { id: number; name: string; provider: string } | undefined;
+    syncConfig?: { id?: number; name: string } | undefined; // TODO: rename to functions or something similar because it also apply to legacy syncs/actions/on-events scripts but also to functions
+    meta?: MessageRow['meta'];
+}
+
+export function getFormattedOperation(
+    data: OperationRowInsert,
+    { account, environment, integration, connection, syncConfig, meta }: AdditionalOperationData = {}
+): OperationRow {
+    const now = new Date();
+    const createdAt = data.createdAt ? new Date(data.createdAt) : now;
+    return {
+        message: operationTypeToMessage[`${data.operation.type}:${data.operation.action}` as ConcatOperationList],
+        id: data.id || `${createdAt.getTime()}_${nanoid(8)}`,
+        operation: data.operation,
+        state: data.state || 'waiting',
+        source: 'internal',
+        level: data.level || 'info',
+        type: 'operation',
+
+        accountId: account?.id ?? data.accountId ?? -1,
+        accountName: account?.name || data.accountName || '',
+
+        environmentId: environment?.id ?? data.environmentId ?? undefined,
+        environmentName: environment?.name || data.environmentName || undefined,
+
+        integrationId: integration?.id ?? data.integrationId ?? undefined,
+        integrationName: integration?.name || data.integrationName || undefined,
+        providerName: integration?.provider || data.providerName || undefined,
+
+        connectionId: connection?.id ?? data.connectionId ?? undefined,
+        connectionName: connection?.name || data.connectionName || undefined,
+
+        syncConfigId: syncConfig?.id || data.syncConfigId || undefined,
+        syncConfigName: syncConfig?.name || data.syncConfigName || undefined,
+
+        jobId: data.jobId || undefined,
+        meta: meta || data.meta || undefined,
+
+        actor: data.actor || undefined,
+
+        createdAt: data.createdAt || now.toISOString(),
+        updatedAt: data.updatedAt || now.toISOString(),
+        startedAt: data.startedAt || null,
+        endedAt: data.endedAt || null,
+        expiresAt: data.expiresAt || defaultOperationExpiration.sync()
+    };
+}
+export function getFormattedMessage(data: SetRequired<Partial<MessageRow>, 'parentId' | 'accountId'>): MessageRow {
+    const now = new Date();
+    return {
+        id: data.id || nanoid(),
+
+        accountId: data.accountId,
+
+        source: data.source || 'internal',
+        level: data.level || 'info',
+        type: data.type || 'log',
+        message: data.message || '',
+        context: data.context,
+
+        parentId: data.parentId,
+
+        error: data.error,
+        request: data.request,
+        response: data.response,
+        retry: data.retry,
+        meta: data.meta,
+        persistResults: data.persistResults,
+
+        createdAt: data.createdAt || now.toISOString(),
+        endedAt: data.endedAt,
+        durationMs: data.durationMs
+    };
+}
+
+export function getFullIndexName(prefix: string, createdAt: string) {
+    return `${prefix}.${new Date(createdAt).toISOString().split('T')[0]}`;
+}
+
+/** Daily indices are concrete `{prefix}.{yyyy-MM-dd}` names. Serverless writes a data stream under the prefix itself. */
+export function getOperationUpdateIndex(createdAt: string, provider: LogsStorageProvider = envs.NANGO_LOGS_PROVIDER): string {
+    if (provider === 'ec-serverless') {
+        return indexOperations.index;
+    }
+    return getFullIndexName(indexOperations.index, createdAt);
+}
+
+export function createCursor({ sort }: Pick<estypes.SearchHit, 'sort'>): string {
+    return Buffer.from(JSON.stringify(sort)).toString('base64');
+}
+
+export function parseCursor(str: string): unknown[] {
+    return JSON.parse(Buffer.from(str, 'base64').toString('utf8')) as unknown[];
+}
+
+export const operationTypeToMessage: Record<ConcatOperationList, string> = {
+    'action:run': 'Action',
+    'admin:impersonation': 'Admin logged into another account',
+    'agent_session:create': 'Agent session created',
+    'agent_session:terminate': 'Agent session terminated',
+    'agent_session:tool_search': 'Agent session tool search',
+    'auth:create_connection': 'Connection created',
+    'auth:post_connection': 'post connection execution',
+    'auth:refresh_token': 'Token refreshed',
+    'auth:connection_test': 'Connection test',
+    'deploy:custom': 'Deploys',
+    'deploy:prebuilt': 'Deploys',
+    'proxy:call': 'Proxy',
+    'sync:cancel': 'Sync execution canceled',
+    'sync:init': 'Sync initialized',
+    'sync:pause': 'Sync schedule paused',
+    'sync:request_run_full': 'Full execution triggered',
+    'sync:request_run': 'Incremental execution triggered',
+    'sync:run': 'Sync executed',
+    'sync:unpause': 'Sync schedule resumed',
+    'sync:create_variant': 'Sync variant created',
+    'sync:delete_variant': 'Sync variant deleted',
+    'webhook:incoming': 'External webhook executed',
+    'webhook:forward': 'External webhook forwarded',
+    'webhook:sync': 'Sync completion webhooks',
+    'webhook:connection_create': 'Connection creation webhooks',
+    'webhook:connection_refresh': 'Token refresh webhooks',
+    'webhook:connection_delete': 'Connection deletion webhooks',
+    'events:post_connection_creation': 'Event-based executions',
+    'events:pre_connection_deletion': 'Event-based executions',
+    'events:validate_connection': 'Event-based executions',
+    'function:invoke': 'Function invoked'
+};
+
+/**
+ * Every value the logs type filter accepts: "all", each operation type and each type:action couple.
+ * Derived from operationTypeToMessage, which the compiler keeps exhaustive, so the filter can't drift
+ * behind a newly added operation type.
+ */
+export const searchOperationsTypes = [
+    'all',
+    ...new Set(Object.keys(operationTypeToMessage).flatMap((couple) => [couple.split(':')[0]!, couple]))
+] as SearchOperationsType[];

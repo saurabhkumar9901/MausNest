@@ -1,0 +1,1251 @@
+import { createPrivateKey, createPublicKey } from 'node:crypto';
+
+import * as z from 'zod';
+
+import { DEFAULT_NANGO_PROXY_BASE_URL_OVERRIDE_DENYLIST, mergeProxyBaseUrlOverrideDenylist } from '../proxy/baseUrlOverrideDenylist.js';
+import { roles } from '../roles.js';
+
+import type { InternalAuthPublicKey } from '@nangohq/types';
+
+const PUBSUB_SUBJECTS = ['user', 'usage', 'team', 'lambda_keep_warm', 'audit'] as const;
+
+export const DEFAULT_RUNNER_EGRESS_NANGO_POD_SELECTOR = {
+    matchExpressions: [{ key: 'app.kubernetes.io/component', operator: 'In' as const, values: ['persist', 'jobs', 'server'] }]
+};
+
+export const DEFAULT_RUNNER_EGRESS_NANGO_PORTS = [80];
+
+/** Kubernetes qualified name: 1–63 chars, alphanumeric, with `-`, `_`, `.` in the middle. */
+const K8S_LABEL_NAME = /^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$/;
+/** DNS-1123 subdomain used as an optional label-key prefix (max 253). */
+const K8S_DNS1123_SUBDOMAIN = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$/;
+const DNS1123_LABEL_MAX_LENGTH = 63;
+const DNS1123_SUBDOMAIN_MAX_LENGTH = 253;
+
+function isK8sLabelName(name: string): boolean {
+    return name.length >= 1 && name.length <= 63 && K8S_LABEL_NAME.test(name);
+}
+
+/** RFC 1123 subdomain: total ≤253, each label ≤63. The regex alone does not cap per-label length. */
+function isK8sDns1123Subdomain(prefix: string): boolean {
+    if (prefix.length < 1 || prefix.length > DNS1123_SUBDOMAIN_MAX_LENGTH || !K8S_DNS1123_SUBDOMAIN.test(prefix)) {
+        return false;
+    }
+    return prefix.split('.').every((label) => label.length <= DNS1123_LABEL_MAX_LENGTH);
+}
+
+/** Kubernetes label key: `[prefix/]name`. Prefix is a DNS-1123 subdomain. */
+function isK8sLabelKey(key: string): boolean {
+    const parts = key.split('/');
+    if (parts.length === 1) {
+        return isK8sLabelName(parts[0]!);
+    }
+    const prefix = parts[0];
+    const name = parts[1];
+    if (parts.length !== 2 || prefix === undefined || name === undefined) {
+        return false;
+    }
+    return isK8sDns1123Subdomain(prefix) && isK8sLabelName(name);
+}
+
+/** Kubernetes label value: empty or a qualified name, max 63 chars. */
+function isK8sLabelValue(value: string): boolean {
+    return value.length <= 63 && (value === '' || K8S_LABEL_NAME.test(value));
+}
+
+const k8sLabelKeySchema = z.string().refine(isK8sLabelKey, {
+    message: 'RUNNER_EGRESS_NANGO_POD_SELECTOR contains an invalid Kubernetes label key'
+});
+const k8sLabelValueSchema = z.string().refine(isK8sLabelValue, {
+    message: 'RUNNER_EGRESS_NANGO_POD_SELECTOR contains an invalid Kubernetes label value'
+});
+
+const runnerEgressNangoPortsSchema = z
+    .string()
+    .optional()
+    .transform((s, ctx) => {
+        if (s === undefined || s.trim() === '') {
+            return [...DEFAULT_RUNNER_EGRESS_NANGO_PORTS];
+        }
+        const ports = new Set<number>();
+        for (const part of s.split(',')) {
+            const trimmed = part.trim();
+            if (trimmed === '') {
+                continue;
+            }
+            const port = Number(trimmed);
+            if (!Number.isInteger(port) || port < 1 || port > 65535) {
+                ctx.addIssue(`Invalid port in RUNNER_EGRESS_NANGO_PORTS: ${part}`);
+                return z.NEVER;
+            }
+            ports.add(port);
+        }
+        if (ports.size === 0) {
+            ctx.addIssue('RUNNER_EGRESS_NANGO_PORTS must include at least one port');
+            return z.NEVER;
+        }
+        return [...ports].sort((a, b) => a - b);
+    });
+
+const runnerEgressNangoPodSelectorSchema = z
+    .string()
+    .optional()
+    .transform((s, ctx) => {
+        if (s === undefined || s.trim() === '') {
+            return structuredClone(DEFAULT_RUNNER_EGRESS_NANGO_POD_SELECTOR);
+        }
+        try {
+            return JSON.parse(s) as unknown;
+        } catch {
+            ctx.addIssue(`Invalid JSON in RUNNER_EGRESS_NANGO_POD_SELECTOR`);
+            return z.NEVER;
+        }
+    })
+    .pipe(
+        z
+            .object({
+                matchLabels: z
+                    .record(z.string(), k8sLabelValueSchema)
+                    .refine((labels) => Object.keys(labels).every(isK8sLabelKey), {
+                        message: 'RUNNER_EGRESS_NANGO_POD_SELECTOR contains an invalid Kubernetes label key'
+                    })
+                    .optional(),
+                matchExpressions: z
+                    .array(
+                        z
+                            .object({
+                                key: k8sLabelKeySchema,
+                                operator: z.enum(['In', 'NotIn', 'Exists', 'DoesNotExist']),
+                                values: z.array(k8sLabelValueSchema).optional()
+                            })
+                            .strict()
+                            .refine(
+                                (expr) => {
+                                    const hasValues = expr.values !== undefined && expr.values.length > 0;
+                                    if (expr.operator === 'In' || expr.operator === 'NotIn') {
+                                        return hasValues;
+                                    }
+                                    return !hasValues;
+                                },
+                                {
+                                    message:
+                                        'RUNNER_EGRESS_NANGO_POD_SELECTOR matchExpressions require values for In/NotIn and must omit values for Exists/DoesNotExist'
+                                }
+                            )
+                    )
+                    .optional()
+            })
+            .strict()
+            .refine(
+                (sel) => {
+                    const hasLabels = sel.matchLabels !== undefined && Object.keys(sel.matchLabels).length > 0;
+                    const hasExpressions = sel.matchExpressions !== undefined && sel.matchExpressions.length > 0;
+                    return hasLabels || hasExpressions;
+                },
+                { message: 'RUNNER_EGRESS_NANGO_POD_SELECTOR must select specific pods (empty selector is not allowed)' }
+            )
+    );
+
+function outboundUrlPolicySchema(varName: string) {
+    return z
+        .string()
+        .optional()
+        .transform((s, ctx) => {
+            if (s === undefined || s.trim() === '') {
+                return undefined;
+            }
+            try {
+                return JSON.parse(s) as unknown;
+            } catch {
+                ctx.addIssue(`Invalid JSON in ${varName}`);
+                return z.NEVER; // tells Zod to stop here and mark parse as failed
+            }
+        })
+        .pipe(
+            z
+                .object({
+                    mode: z.enum(['denylist', 'allowlist', 'permissive']).optional(),
+                    denylist: z.array(z.string()).optional(),
+                    allowlist: z.array(z.string()).optional(),
+                    blockPrivateIps: z.boolean().optional(),
+                    blockLinkLocal: z.boolean().optional(),
+                    maxRedirects: z.number().int().nonnegative().optional()
+                })
+                .strict()
+                .optional()
+        );
+}
+
+const INTERNAL_AUTH_KID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const INTERNAL_AUTH_RAW_PUBLIC_KEY = /^[A-Za-z0-9_-]{43}$/;
+
+/** JSON array of `{ kid, publicKey }`. Blank or unset is an empty list. */
+function internalAuthPublicKeysSchema(varName: string) {
+    return z
+        .string()
+        .optional()
+        .transform((raw, ctx) => {
+            const value = raw?.trim();
+            if (!value) {
+                return [];
+            }
+            try {
+                return JSON.parse(value) as unknown;
+            } catch {
+                ctx.addIssue(`Invalid JSON in ${varName}`);
+                return z.NEVER;
+            }
+        })
+        .pipe(
+            z
+                .array(
+                    z.object({
+                        kid: z.string().regex(INTERNAL_AUTH_KID),
+                        publicKey: z.string().regex(INTERNAL_AUTH_RAW_PUBLIC_KEY)
+                    })
+                )
+                .check((payload) => {
+                    const seen = new Set<string>();
+                    for (const [index, entry] of payload.value.entries()) {
+                        if (seen.has(entry.kid)) {
+                            payload.issues.push({
+                                code: 'custom',
+                                message: `${varName} repeats kid ${entry.kid}`,
+                                path: [index, 'kid'],
+                                input: entry.kid
+                            });
+                        }
+                        seen.add(entry.kid);
+                    }
+                })
+        );
+}
+
+const ENVS_SHAPE = z.object({
+    // Node ecosystem
+    NODE_ENV: z.enum(['production', 'staging', 'development', 'test']).default('development'), // TODO: a better name would be NANGO_ENV
+    CI: z.coerce.boolean().default(false),
+    VITEST: z.coerce.boolean().default(false),
+    TZ: z.string().default('UTC'),
+
+    // Dockerfile
+    GIT_HASH: z.string().optional(),
+
+    // Auth
+    WORKOS_API_KEY: z.string().optional(),
+    WORKOS_CLIENT_ID: z.string().optional(),
+    NANGO_DASHBOARD_USERNAME: z.string().optional(),
+    NANGO_DASHBOARD_PASSWORD: z.string().optional(),
+    LOCAL_NANGO_USER_ID: z.coerce.number().int().nonnegative().optional(),
+    AUTH_ALLOW_SIGNUP: z.stringbool().optional().default(true),
+    DEFAULT_USER_ROLE: z.enum(roles).optional().default('administrator'),
+    AUTH_SHADOW_CACHE_TTL_MS: z.coerce.number().int().positive().optional().default(60_000), // 1 minute
+    // In-process cache of the persist auth context (persist internal-secret route).
+    AUTH_PERSIST_CONTEXT_CACHE_ENABLED: z.stringbool().optional().default(false),
+    // Cached entries are served for up to this long, so revoked keys, deleted environments, and plan
+    // changes stay visible until it elapses. Avoid raising it beyond 1 minute unless strictly
+    // necessary — a larger TTL widens that eventual-consistency window. Read once at startup.
+    AUTH_PERSIST_CONTEXT_CACHE_TTL_MS: z.coerce.number().int().positive().max(60_000).optional().default(60_000), // 1 minute
+
+    // License configuration options
+    NANGO_LICENSE: z.string().optional(),
+    // Experimental, disabled by default for now
+    NANGO_LICENSE_CHECK: z.stringbool().optional().default(false),
+
+    // API
+    NANGO_PORT: z.coerce.number().optional().default(3003), // Sync those two ports?
+    SERVER_PORT: z.coerce.number().optional().default(3003),
+    NANGO_SERVER_URL: z.url().optional(),
+    // Where the dashboard sends its API requests. Defaults to NANGO_SERVER_URL when unset.
+    // `/` keeps requests on whichever host served the dashboard (same-origin).
+    NANGO_DASHBOARD_API_URL: z.url().or(z.literal('/')).optional(),
+    NANGO_MANAGEMENT_MCP_SERVER_URL: z.url().optional(),
+    NANGO_OPENAI_APPS_CHALLENGE_TOKEN: z.string().optional(),
+    NANGO_OAUTH_SERVER_BASE_URL: z.url().optional(),
+    NANGO_OAUTH_SERVER_COOKIE_KEYS: z.string().optional(),
+    NANGO_OAUTH_SERVER_JWKS: z.string().optional(),
+    NANGO_SERVER_KEEP_ALIVE_TIMEOUT: z.coerce.number().optional().default(61_000),
+    DEFAULT_RATE_LIMIT_PER_MIN: z.coerce.number().min(1).optional().default(200),
+    NANGO_CATALOG_CODE_RATE_LIMIT_PER_DAY: z.coerce.number().int().min(0).optional().default(500),
+    NANGO_CACHE_ENV_KEYS: z.stringbool().optional().default(false),
+    NANGO_SERVER_WEBSOCKETS_PATH: z.string().optional(),
+    NANGO_ADMIN_INVITE_TOKEN: z.string().optional(),
+    NANGO_SERVER_PUBLIC_BODY_LIMIT: z.string().optional().default('75mb'),
+    NANGO_SERVER_OAUTH2_TOKEN_MAX_LENGTH: z.coerce
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .default(16 * 1024),
+    SERVER_SHUTDOWN_DELAY_MS: z.coerce.number().optional().default(0),
+    SERVER_EGRESS_TELEMETRY_BATCH_SIZE: z.coerce.number().int().positive().default(1_000),
+    SERVER_EGRESS_TELEMETRY_FLUSH_INTERVAL_MS: z.coerce.number().int().nonnegative().default(60_000),
+    SERVER_EGRESS_TELEMETRY_MAX_QUEUE_SIZE: z.coerce.number().int().positive().default(100_000),
+    NANGO_PROXY_BASE_URL_OVERRIDE_ENABLED: z.stringbool().optional().default(true),
+    NANGO_PROXY_BASE_URL_OVERRIDE_DENYLIST: z
+        .string()
+        .optional()
+        .transform((s, ctx) => {
+            if (s === undefined) {
+                return [...DEFAULT_NANGO_PROXY_BASE_URL_OVERRIDE_DENYLIST];
+            }
+            const trimmed = s.trim();
+            if (trimmed === '') {
+                return [];
+            }
+            try {
+                const parsed = JSON.parse(trimmed);
+                if (!Array.isArray(parsed) || !parsed.every((item: unknown) => typeof item === 'string')) {
+                    ctx.addIssue(`NANGO_PROXY_BASE_URL_OVERRIDE_DENYLIST must be a JSON array of strings`);
+                    return z.NEVER;
+                }
+                if (parsed.length === 0) {
+                    return [];
+                }
+                const customEntries = parsed.map((e: string) => e.trim()).filter((e: string) => e.length > 0);
+                return mergeProxyBaseUrlOverrideDenylist(customEntries);
+            } catch {
+                ctx.addIssue(`NANGO_PROXY_BASE_URL_OVERRIDE_DENYLIST must be a valid JSON array of strings`);
+                return z.NEVER;
+            }
+        }),
+    NANGO_PROXY_MAX_RETRY_WAIT_MS: z.coerce
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .default(10 * 60 * 1000), // 10 minutes
+    // A proxy request fails once no bytes arrive for this long (see ProxyRequest for the exact axios semantics)
+    NANGO_PROXY_IDLE_TIMEOUT_MS: z.coerce
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .default(5 * 60 * 1000), // 5 minutes
+    NANGO_WEBHOOK_MAX_RETRY_WAIT_MS: z.coerce
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .default(10 * 60 * 1000), // 10 minutes
+    // Outbound URL policy (JSON), consumed by @nangohq/egress for proxy/webhook/uncontrolledFetch paths.
+    NANGO_OUTBOUND_URL_POLICY: outboundUrlPolicySchema('NANGO_OUTBOUND_URL_POLICY'),
+    // Outbound URL policy overlay for OAuth/token flows. Applied on top of NANGO_OUTBOUND_URL_POLICY,
+    // but RFC1918 blocking defaults off (configurable) so self-hosted token endpoints keep working.
+    NANGO_OUTBOUND_URL_POLICY_OAUTH: outboundUrlPolicySchema('NANGO_OUTBOUND_URL_POLICY_OAUTH'),
+
+    // Connect
+    NANGO_PUBLIC_CONNECT_URL: z.url().optional(),
+    NANGO_CONNECT_UI_PORT: z.coerce.number().optional().default(3009),
+    PUBLIC_AUTHENTICATION_DEPRECATION_DATE: z.coerce.date().catch(new Date('2025-08-25')),
+
+    // Crons
+    CRON_EXPORT_USAGE_MINUTES: z.coerce.number().optional().default(60),
+    CRON_TIMEOUT_LOGS_MINUTES: z.coerce.number().optional().default(10),
+    CRON_DELETE_OLD_JOBS_LIMIT: z.coerce.number().optional().default(1000),
+    CRON_DELETE_OLD_DATA_EVERY_MIN: z.coerce.number().optional().default(10),
+    CRON_DELETE_OLD_JOBS_MAX_DAYS: z.coerce.number().optional().default(31),
+    CRON_DELETE_OLD_CONNECT_SESSION_MAX_DAYS: z.coerce.number().optional().default(31),
+    CRON_DELETE_OLD_PRIVATE_KEYS_MAX_DAYS: z.coerce.number().optional().default(31),
+    CRON_DELETE_OLD_OAUTH_SESSION_MAX_DAYS: z.coerce.number().optional().default(2),
+    CRON_DELETE_OLD_INVITATIONS_MAX_DAYS: z.coerce.number().optional().default(2),
+    CRON_DELETE_OLD_SYNCS_MAX_DAYS: z.coerce.number().optional().default(1),
+    CRON_DELETE_OLD_SYNCS_LIMIT: z.coerce.number().optional().default(25),
+    CRON_DELETE_OLD_CONFIGS_MAX_DAYS: z.coerce.number().optional().default(31),
+    CRON_DELETE_OLD_SYNC_CONFIGS_MAX_DAYS: z.coerce.number().optional().default(31),
+    CRON_DELETE_OLD_FUNCTION_CONFIGS_MAX_DAYS: z.coerce.number().optional().default(31),
+    CRON_DELETE_OLD_CONNECTIONS_MAX_DAYS: z.coerce.number().optional().default(31),
+    CRON_DELETE_OLD_ENVIRONMENTS_MAX_DAYS: z.coerce.number().optional().default(31),
+    CRON_REFRESH_CONNECTIONS_EVERY_MIN: z.coerce.number().optional().default(10),
+    CRON_REFRESH_CONNECTIONS_LIMIT: z.coerce.number().optional().default(100),
+    CRON_MANAGE_GROWTH_ADDONS_EVERY_MIN: z.coerce.number().optional().default(60),
+    CRON_LAMBDA_KEEP_WARM_EVERY_MINUTES: z.coerce.number().optional().default(0),
+    // Billing-events S3 export cron (hourly). Value is the minute-of-the-hour the
+    // cron fires on (0–59). -1 (default) disables the cron entirely. 15 gives
+    // ClickHouse a ~15min buffer to ingest the previous UTC day's tail before we
+    // snapshot it.
+    CRON_BILLING_EVENTS_S3_HOURLY_EXPORT_MINUTE: z.coerce.number().min(-1).max(59).optional().default(-1),
+    // Triggers the count of files in BILLING_EVENTS_S3_DLQ_BUCKET (must also be set). -1 disables.
+    CRON_BILLING_EVENTS_S3_DLQ_MONITOR_MINUTE: z.coerce.number().min(-1).max(59).optional().default(-1),
+
+    // Metering
+    METERING_USAGE_EVENTS_SUBSCRIBE_CONCURRENCY: z.coerce.number().int().min(1).optional().default(1),
+    METERING_AUDIT_EVENTS_SUBSCRIBE_CONCURRENCY: z.coerce.number().int().min(1).optional().default(1),
+
+    // Persist
+    PERSIST_SERVICE_URL: z.url().optional(),
+    PERSIST_HARD_DELETE_LIMIT: z.coerce.number().int().positive().optional().default(50_000),
+    PERSIST_AUTO_PRUNING_INTERVAL_MS: z.coerce.number().optional().default(5_000), // set to 0 to disable
+    PERSIST_AUTO_PRUNING_LIMIT: z.coerce.number().optional().default(1_000),
+    PERSIST_AUTO_PRUNING_STALE_AFTER_MS: z.coerce
+        .number()
+        .optional()
+        .default(30 * 24 * 3600 * 1000), // 30 days
+    PERSIST_AUTO_DELETING_INTERVAL_MS: z.coerce.number().optional().default(5_000), // set to 0 to disable
+    PERSIST_AUTO_DELETING_LIMIT: z.coerce.number().optional().default(1_000),
+    PERSIST_AUTO_DELETING_STALE_AFTER_MS: z.coerce
+        .number()
+        .optional()
+        .default(60 * 24 * 3600 * 1000), // 60 days
+    RECORDS_POSTGRES_SEEN_PARTITION_INTERVAL_MS: z.coerce
+        .number()
+        .positive()
+        .max(6 * 3600 * 1000) // max 6 hours to ensure the records_seen daily partition for next day is always created ahead of time
+        .default(1 * 3600 * 1000),
+    RECORDS_POSTGRES_SEEN_PARTITION_MAX_AGE_MS: z.coerce
+        .number()
+        .optional()
+        .default(48 * 3600 * 1000), // 48 hours
+    NANGO_PERSIST_PORT: z.coerce.number().optional().default(3007),
+    NANGO_PERSIST_KEEP_ALIVE_TIMEOUT_MS: z.coerce.number().optional(),
+
+    // Orchestrator
+    ORCHESTRATOR_SERVICE_URL: z.url().optional(),
+    NANGO_ORCHESTRATOR_PORT: z.coerce.number().optional().default(3008),
+    NANGO_ORCHESTRATOR_KEEP_ALIVE_TIMEOUT_MS: z.coerce.number().optional(),
+    ORCHESTRATOR_DATABASE_URL: z.url().optional(),
+    ORCHESTRATOR_DATABASE_SCHEMA: z.string().optional().default('nango_scheduler'),
+    ORCHESTRATOR_DB_POOL_MAX: z.coerce.number().optional().default(50),
+    ORCHESTRATOR_EXPIRING_TICK_INTERVAL_MS: z.coerce.number().optional().default(1000),
+    ORCHESTRATOR_CLEANING_TICK_INTERVAL_MS: z.coerce.number().optional().default(10000),
+    ORCHESTRATOR_CLEANING_OLDER_THAN_DAYS: z.coerce.number().optional().default(5),
+    ORCHESTRATOR_SCHEDULING_TICK_INTERVAL_MS: z.coerce.number().optional().default(100),
+    ORCHESTRATOR_BACKPRESSURE_MONITORING_TICK_INTERVAL_MS: z.coerce.number().optional().default(10000),
+    ORCHESTRATOR_BACKPRESSURE_MONITORING_TOP_N: z.coerce.number().optional().default(10),
+    ORCHESTRATOR_CONCURRENCY_SAMPLING_TICK_INTERVAL_MS: z.coerce
+        .number()
+        .int()
+        .refine((ms) => ms === 0 || ms >= 1000, { message: 'must be 0 (disabled) or at least 1000' })
+        .default(1000),
+    ORCHESTRATOR_CONCURRENCY_SAMPLING_QUERY_TIMEOUT_MS: z.coerce.number().int().min(1000).max(5000).default(1000),
+    ORCHESTRATOR_TASK_CREATED_EVENT_DEBOUNCE_MS: z.coerce.number().optional().default(100),
+    ORCHESTRATOR_TASK_CREATED_PER_GROUP_COUNT_MAX: z.coerce.number().optional().default(10_000),
+    ORCHESTRATOR_THROTTLED_IMMEDIATE_PER_MIN: z.coerce.number().int().nonnegative().optional().default(0),
+    ORCHESTRATOR_DB_SSL: z.stringbool().optional().default(false),
+    ORCHESTRATOR_EXPIRING_TASKS_BATCH_SIZE: z.coerce.number().optional().default(1000),
+
+    // Tasks (generic server-side task queue, see @nangohq/tasks). Runs in an isolated schema on the main Nango DB.
+    TASKS_DATABASE_SCHEMA: z
+        .string()
+        .regex(/^[a-z_][a-z0-9_]*$/i, 'TASKS_DATABASE_SCHEMA must be a valid Postgres identifier ([A-Za-z_][A-Za-z0-9_]*)')
+        .optional()
+        .default('nango_tasks'),
+    TASKS_DB_POOL_MAX: z.coerce.number().optional().default(10),
+
+    // Jobs
+    // When false, action start logs omit the action input. The start message itself is still written.
+    NANGO_LOG_FUNCTION_INPUT: z.stringbool().optional().default(true),
+    NANGO_LOG_FUNCTION_OUTPUT: z.stringbool().optional().default(true),
+    JOBS_SERVICE_URL: z.url().optional().default('http://localhost:3005'),
+    JOBS_NAMESPACE: z.string().optional().default('nango'),
+    NANGO_JOBS_PORT: z.coerce.number().optional().default(3005),
+    NANGO_JOBS_KEEP_ALIVE_TIMEOUT_MS: z.coerce.number().optional(),
+    PROVIDERS_URL: z.url().optional(),
+    PROVIDERS_RELOAD_INTERVAL: z.coerce.number().optional().default(60000),
+    JOBS_PROCESSOR_CONFIG: z
+        .string()
+        .transform((s, ctx) => {
+            try {
+                return JSON.parse(s);
+            } catch {
+                ctx.addIssue(`Invalid JSON in JOBS_PROCESSOR_CONFIG`);
+                return z.NEVER; // tells Zod to stop here and mark parse as failed
+            }
+        })
+        .pipe(
+            z.array(
+                z.object({
+                    groupKeyPattern: z.string(),
+                    maxConcurrency: z.coerce.number()
+                })
+            )
+        )
+        .default([
+            {
+                groupKeyPattern: 'sync*',
+                maxConcurrency: 200
+            },
+            {
+                groupKeyPattern: 'action*',
+                maxConcurrency: 200
+            },
+            {
+                groupKeyPattern: 'function*',
+                maxConcurrency: 200
+            },
+            {
+                groupKeyPattern: 'webhook*',
+                maxConcurrency: 200
+            },
+            {
+                groupKeyPattern: 'on-event*',
+                maxConcurrency: 50
+            }
+        ]),
+    SYNC_ENVIRONMENT_MAX_CONCURRENCY: z.coerce.number().optional().default(500),
+    ACTION_ENVIRONMENT_MAX_CONCURRENCY: z.coerce.number().optional().default(500),
+    WEBHOOK_ENVIRONMENT_MAX_CONCURRENCY: z.coerce.number().optional().default(500),
+    ON_EVENT_ENVIRONMENT_MAX_CONCURRENCY: z.coerce.number().optional().default(100),
+
+    // Self-hosting
+    NANGO_SELF_HOSTING_PORT: z.coerce.number().optional().default(3010),
+    NANGO_SELF_HOSTING_DATABASE_URL: z.url().optional(),
+    NANGO_SELF_HOSTING_DATABASE_SSL: z.stringbool().optional().default(false),
+    NANGO_SELF_HOSTING_DB_POOL_MAX: z.coerce.number().int().positive().optional().default(5),
+
+    // Runner
+    RUNNER_SECRET_KEY: z.string().optional(),
+    RUNNER_TYPE: z.enum(['LOCAL', 'REMOTE', 'RENDER', 'KUBERNETES']).default('LOCAL'),
+    RUNNER_FLEET_ID: z
+        .string()
+        .regex(/^[a-zA-Z0-9_-]+$/)
+        .optional()
+        .default('nango_runners'),
+    RUNNER_LAMBDA_FLEET_ID: z.string().optional().default('nango_runners_lambda'),
+    RUNNER_DO_NOT_DISRUPT: z.stringbool().optional().default(true),
+    RUNNER_PROFILED_ACCOUNTS: z
+        .string()
+        .transform((s, ctx) => {
+            try {
+                return JSON.parse(s);
+            } catch {
+                ctx.addIssue(`RUNNER_PROFILED_ACCOUNTS must be a valid JSON array of strings`);
+                return z.NEVER; // tells Zod to stop here and mark parse as failed
+            }
+        })
+        .pipe(z.array(z.string()))
+        .default([]),
+    RUNNER_SERVICE_URL: z.url().optional(),
+    NANGO_RUNNER_PATH: z.string().optional(),
+    NANGO_RUNNER_KEEP_ALIVE_TIMEOUT_MS: z.coerce.number().optional(),
+    RUNNER_OWNER_ID: z.string().optional(),
+    IDLE_MAX_DURATION_MS: z.coerce.number().default(0),
+    RUNNER_NODE_ID: z.coerce.number().default(1),
+    RUNNER_CONFLICT_RESOLUTION_MODE: z.enum(['IN_MEMORY', 'DISTRIBUTED']).default('IN_MEMORY'),
+    RUNNER_URL: z.url().optional(),
+    RUNNER_MEMORY_WARNING_THRESHOLD: z.coerce.number().optional().default(85),
+    RUNNER_NAMESPACE: z.string().optional().default('nango'),
+    RUNNER_EGRESS_NANGO_POD_SELECTOR: runnerEgressNangoPodSelectorSchema,
+    RUNNER_EGRESS_NANGO_PORTS: runnerEgressNangoPortsSchema,
+    RUNNER_HTTP_LOG_SAMPLE_PCT: z.coerce.number().optional(),
+    NAMESPACE_PER_RUNNER: z.stringbool().optional().default(false),
+    RUNNER_CLIENT_HEADERS_TIMEOUT_MS: z.coerce.number().optional().default(10_000),
+    RUNNER_CLIENT_CONNECT_TIMEOUT_MS: z.coerce.number().optional().default(5000),
+    RUNNER_CLIENT_RESPONSE_TIMEOUT_MS: z.coerce.number().optional().default(15_000),
+    RUNNER_MAX_REQUEST_CPU: z.coerce.number().optional().default(4000),
+    RUNNER_MAX_REQUEST_MEMORY: z.coerce.number().optional().default(16384),
+    RUNNER_MIN_REQUEST_CPU: z.coerce.number().optional().default(500),
+    RUNNER_MIN_REQUEST_MEMORY: z.coerce.number().optional().default(512),
+    RUNNER_REQUEST_CPU_MULTIPLIER: z.coerce.number().optional().default(1.4),
+    RUNNER_REQUEST_MEMORY_MULTIPLIER: z.coerce.number().optional().default(1.4),
+    NANGO_RUNNER_URL_SCHEME: z.enum(['http', 'https']).optional().default('http'),
+    RUNNER_ABORT_CHECK_INTERVAL_MS: z.coerce.number().optional().default(1_000),
+    RUNNER_HEARTBEAT_INTERVAL_MS: z.coerce.number().optional().default(30_000),
+    RUNNER_SYNC_CONFLICT_HEARTBEAT_INTERVAL_MULTIPLIER: z.coerce.number().optional().default(3.1),
+    RUNNER_TELEMETRY_BATCH_SIZE: z.coerce.number().int().positive().max(1000).default(500),
+    RUNNER_TELEMETRY_FLUSH_INTERVAL_MS: z.coerce.number().int().nonnegative().default(10_000),
+
+    // FLEET
+    RUNNERS_DATABASE_URL: z.url().optional(),
+    FLEET_SUPERVISOR_LOCK_KEY: z.string().default('fleet_supervisor'),
+    FLEET_TIMEOUT_PENDING_MS: z.coerce
+        .number()
+        .optional()
+        .default(60 * 60 * 1000), // 1 hour
+    FLEET_TIMEOUT_STARTING_MS: z.coerce
+        .number()
+        .optional()
+        .default(5 * 60 * 1000), // 5 minutes
+    FLEET_TIMEOUT_FINISHING_MS: z.coerce
+        .number()
+        .optional()
+        .default(25 * 60 * 60 * 1000), // 25 hours
+    FLEET_TIMEOUT_IDLE_MS: z.coerce
+        .number()
+        .optional()
+        .default(15 * 60 * 1000), // 15 minutes
+    FLEET_TIMEOUT_TERMINATED_MS: z.coerce
+        .number()
+        .optional()
+        .default(24 * 60 * 60 * 1000), // 24 hours
+    FLEET_TIMEOUT_ERROR_MS: z.coerce
+        .number()
+        .optional()
+        .default(24 * 60 * 60 * 1000), // 24 hours
+    FLEET_TIMEOUT_GET_RUNNING_NODE_MS: z.coerce
+        .number()
+        .optional()
+        .default(60 * 1000), // 1 minute
+    FLEET_RETRY_DELAY_GET_RUNNING_NODE_MS: z.coerce.number().optional().default(1000), // 1 sec
+    FLEET_SUPERVISOR_TIMEOUT_TICK_MS: z.coerce
+        .number()
+        .optional()
+        .default(60 * 1000), // 1 minute
+    FLEET_SUPERVISOR_TIMEOUT_STOP_MS: z.coerce
+        .number()
+        .optional()
+        .default(60 * 1000), // 1 minute
+    FLEET_SUPERVISOR_RETRY_DELAY_MS: z.coerce
+        .number()
+        .optional()
+        .default(5 * 1000), // 5 seconds
+    FLEET_SUPERVISOR_WAIT_TICK_MS: z.coerce.number().optional().default(1000), // 1 sec
+    FLEET_TIMEOUT_HEALTHY_MS: z.coerce
+        .number()
+        .optional()
+        .default(2 * 60 * 1000), // 2 minutes
+    FLEET_DB_POOL_MAX: z.coerce.number().optional().default(5),
+
+    // Billing
+    FLAG_PLAN_ENABLED: z.stringbool().optional().default(false),
+    FLAG_USAGE_ENABLED: z.stringbool().optional().default(false),
+    ORB_API_KEY: z.string().optional(),
+    ORB_WEBHOOKS_SECRET: z.string().optional(),
+    ORB_MAX_RETRIES: z.coerce.number().optional().default(3),
+    BILLING_EVENTS_S3_BUCKET: z.string().optional(),
+    BILLING_EVENTS_S3_WRITER_ROLE_ARN: z.string().optional(),
+    BILLING_EVENTS_S3_REGION: z.string().optional().default('us-west-2'),
+    // DLQ bucket Orb writes to when it can't ingest a billing event. Watched by the
+    // metering DLQ monitor cron (CRON_BILLING_EVENTS_S3_DLQ_MONITOR_MINUTE).
+    BILLING_EVENTS_S3_DLQ_BUCKET: z.string().optional(),
+
+    // ClickHouse
+    CLICKHOUSE_URL: z.string().optional(),
+    CLICKHOUSE_USAGE_INGEST_BATCH_SIZE: z.coerce.number().optional().default(10_000),
+    CLICKHOUSE_USAGE_INGEST_BATCH_INTERVAL_MS: z.coerce.number().optional().default(5_000),
+    CLICKHOUSE_USAGE_INGEST_MAX_QUEUE_SIZE: z.coerce.number().optional().default(500_000),
+
+    // Usage
+    USAGE_CAPPING_ENABLED: z.stringbool().optional().default(false),
+    USAGE_REVALIDATE_AFTER_MS: z.coerce.number().optional().default(3_600_000), // 1 hour
+    USAGE_BILLING_API_MAX_RPS: z.coerce.number().optional().default(5), // max requests per second to Orb API usage endpoint is 10, keeping some margin
+    USAGE_BILLING_API_MAX_QUEUE_SIZE: z.coerce.number().optional().default(100), // max queued requests by rate limiter
+    USAGE_BILLING_API_CACHE_TTL_SECONDS: z.coerce
+        .number()
+        .optional()
+        .default(3600 * 6), // 6 hour
+
+    // --- Third parties
+    // AWS
+    AWS_REGION: z.string().optional(),
+    AWS_BUCKET_NAME: z.string().optional(),
+    AWS_ACCESS_KEY_ID: z.string().optional(),
+    AWS_SECRET_ACCESS_KEY: z.string().optional(),
+
+    AWS_INTEGRATIONS_ACCESS_KEY_ID: z.string().optional(),
+    AWS_INTEGRATIONS_SECRET_ACCESS_KEY: z.string().optional(),
+    AWS_INTEGRATIONS_REGION: z.string().optional(),
+    AWS_INTEGRATIONS_BUCKET_NAME: z.string().optional(),
+
+    GCS_INTEGRATIONS_BUCKET_NAME: z.string().optional(),
+
+    AZURE_INTEGRATIONS_ACCOUNT_NAME: z.string().optional(),
+    AZURE_INTEGRATIONS_CONTAINER_NAME: z.string().optional(),
+    AZURE_INTEGRATIONS_ACCOUNT_KEY: z.string().optional(),
+    OBJECT_STORE_DELETE_CONCURRENCY: z.coerce.number().int().min(1).optional().default(16),
+
+    // BQ
+    GOOGLE_APPLICATION_CREDENTIALS: z.string().optional(),
+    FLAG_AUTH_ROLES_ENABLED: z.stringbool().optional().default(false),
+    FLAG_AUDIT_TRAIL_ENABLED: z.stringbool().optional().default(false),
+    FLAG_HOSTED_TELEMETRY_ENABLED: z.stringbool().optional().default(true),
+    FLAG_BIG_QUERY_EXPORT_ENABLED: z.stringbool().optional().default(false),
+
+    // Datadog
+    DD_ENV: z.string().optional(),
+    DD_SITE: z.string().optional(),
+    DD_TRACE_AGENT_URL: z.string().optional(),
+    DD_API_KEY_SECRET_ARN: z.string().optional(),
+
+    // Elasticsearch / OpenSearch (logs)
+    NANGO_LOGS_PROVIDER: z.enum(['elasticsearch', 'opensearch', 'ec-serverless']).optional().default('elasticsearch'),
+    NANGO_LOGS_ES_URL: z.url().optional(),
+    NANGO_LOGS_ES_REQUEST_TIMEOUT_MS: z.coerce.number().optional().default(5000),
+    NANGO_LOGS_ES_MAX_RETRIES: z.coerce.number().optional().default(1),
+    NANGO_LOGS_ES_USER: z.string().optional(),
+    NANGO_LOGS_ES_PWD: z.string().optional(),
+    NANGO_LOGS_ES_API_KEY: z.string().optional(),
+    NANGO_LOGS_ENABLED: z.stringbool().optional().default(false),
+    NANGO_LOGS_ES_PREFIX: z.string().optional(),
+    NANGO_LOGS_ES_INDEX_OPERATIONS: z.string().optional(),
+    NANGO_LOGS_ES_INDEX_MESSAGES: z.string().optional(),
+    NANGO_LOGS_ES_SHARD_PER_DAY_OPERATIONS: z.coerce.number().optional().default(1),
+    NANGO_LOGS_ES_SHARD_PER_DAY_MESSAGES: z.coerce.number().optional().default(1),
+    NANGO_LOGS_ES_WARM_MIN_AGE: z.string().optional().default('48h'),
+    NANGO_LOGS_ES_RETENTION_DAYS: z.coerce.number().int().positive().optional().default(15),
+    NANGO_LOGS_CIRCUIT_BREAKER_FAILURE_THRESHOLD: z.coerce.number().optional().default(3),
+    NANGO_LOGS_CIRCUIT_BREAKER_RECOVERY_THRESHOLD: z.coerce.number().optional().default(1),
+    NANGO_LOGS_CIRCUIT_BREAKER_HEALTHCHECK_INTERVAL_MS: z.coerce.number().optional().default(3000),
+
+    // Network
+    NANGO_RETRYABLE_NETWORK_ERRORS: z.string().optional(),
+
+    // Logodev
+    PUBLIC_LOGODEV_KEY: z.string().optional(),
+
+    // Mailgun
+    MAILGUN_API_KEY: z.string().optional(),
+    MAILGUN_URL: z.url().optional(),
+
+    // SMTP
+    SMTP_URL: z.url().optional(),
+    SMTP_FROM: z.string().default('Nango <noreply@email.nango.dev>'),
+    SMTP_DOMAIN: z.string().default('email.nango.dev'),
+
+    // Generic HTTP email API (SendGrid, Resend, Postmark, ...)
+    EMAIL_HTTP_URL: z.url().optional(),
+    EMAIL_HTTP_HEADERS: z
+        .string()
+        .optional()
+        .transform((s, ctx) => {
+            if (s === undefined || s.trim() === '') {
+                return {};
+            }
+            try {
+                return JSON.parse(s) as unknown;
+            } catch {
+                ctx.addIssue(`Invalid JSON in EMAIL_HTTP_HEADERS`);
+                return z.NEVER; // tells Zod to stop here and mark parse as failed
+            }
+        })
+        .pipe(z.record(z.string(), z.string())),
+    // JSON payload the mail API expects, with {{to}}, {{from}}, {{subject}} and {{html}} as placeholders
+    EMAIL_HTTP_BODY: z
+        .string()
+        .optional()
+        .transform((s, ctx) => {
+            if (s === undefined || s.trim() === '') {
+                return undefined;
+            }
+            try {
+                return JSON.parse(s) as unknown;
+            } catch {
+                ctx.addIssue(`Invalid JSON in EMAIL_HTTP_BODY`);
+                return z.NEVER; // tells Zod to stop here and mark parse as failed
+            }
+        })
+        // Mail APIs take a JSON object; without this an array/string/number parses fine here and
+        // only surfaces as an opaque API rejection at send time.
+        .pipe(z.record(z.string(), z.unknown()).optional()),
+    EMAIL_HTTP_TIMEOUT_MS: z.coerce.number().int().positive().optional().default(10_000),
+
+    // Postgres
+    NANGO_DATABASE_URL: z.url().optional(),
+    NANGO_DB_READ_URL: z.url().optional(),
+    NANGO_DB_HOST: z.string().optional().default('localhost'),
+    NANGO_DB_PORT: z.coerce.number().optional().default(5432),
+    NANGO_DB_USER: z.string().optional().default('nango'),
+    NANGO_DB_NAME: z.string().optional().default('nango'),
+    NANGO_DB_PASSWORD: z.string().optional().default('nango'),
+    NANGO_DB_SSL: z.stringbool().optional().default(false),
+    NANGO_DB_CLIENT: z.string().optional(),
+    NANGO_ENCRYPTION_KEY: z
+        .string({
+            error: 'To learn more about NANGO_ENCRYPTION_KEY, reach out to support.'
+        })
+        .optional(),
+    // KMS-wrapped alternative to NANGO_ENCRYPTION_KEY (mutually exclusive, enforced at DEK load).
+    NANGO_ENCRYPTION_KEY_WRAPPED: z.string().optional(),
+    NANGO_KMS_KEY_ARN: z.string().optional(),
+    NANGO_GCP_KMS_KEY_NAME: z.string().optional(), // GCP-KMS alternative wrapping-key identifier
+    NANGO_AZURE_KMS_KEY_ID: z.string().optional(), // Azure Key Vault alternative: versioned key identifier
+    NANGO_DB_SCHEMA: z.string().optional().default('nango'),
+    NANGO_DB_ADDITIONAL_SCHEMAS: z.string().optional(),
+    NANGO_DB_APPLICATION_NAME: z.string().optional().default('[unknown]'),
+
+    // Optional website-to-signup ad context.
+    SIGNUP_AD_CONTEXT_ENABLED: z.stringbool().optional().default(false),
+    SIGNUP_AD_CONTEXT_COOKIE_NAME: z
+        .string()
+        .optional()
+        .transform(presentEnv)
+        .pipe(
+            z
+                .string()
+                .regex(/^[A-Za-z0-9_]{1,64}$/)
+                .optional()
+        ),
+
+    // PostHog
+    PUBLIC_POSTHOG_KEY: z.string().optional(),
+    PUBLIC_POSTHOG_HOST: z.string().optional(),
+
+    // Records
+    RECORDS_DATABASE_URL: z.url().optional(),
+    RECORDS_DATABASE_READ_URL: z.url().optional(),
+    RECORDS_DATABASE_SCHEMA: z.string().optional().default('nango_records'),
+    RECORDS_DATABASE_SSL: z.stringbool().optional().default(false),
+
+    RECORDS_2_DATABASE_URL: z.url().optional(),
+    RECORDS_2_DATABASE_READ_URL: z.url().optional(),
+    RECORDS_2_DATABASE_SCHEMA: z.string().optional().default('nango_records_2'),
+    RECORDS_2_DATABASE_SSL: z.stringbool().optional().default(false),
+
+    RECORDS_DATABASE_POOL_MIN: z.coerce.number().optional().default(2),
+    RECORDS_DATABASE_POOL_MAX: z.coerce.number().optional().default(50),
+    RECORDS_DATABASE_STATEMENT_TIMEOUT_MS: z.coerce.number().optional().default(60000),
+    RECORDS_BATCH_SIZE: z.coerce.number().optional().default(1000),
+    // Per-request byte budget for getRecords. Compared against the sum of
+    // pg_column_size(records_data.data) (compressed on-disk size, smaller
+    // than wire bytes by 1.5–3×). 0 disables the budget and returns all the requested records.
+    RECORDS_MAX_RESPONSE_SIZE_BYTES: z.coerce.number().optional().default(0),
+    // When true, the budget only emits a metric instead of truncating — used to size the limit before enforcing.
+    RECORDS_MAX_RESPONSE_SIZE_DRY_RUN: z.stringbool().optional().default(true),
+    // Max number of records decrypted concurrently in getRecords. decryptAsync offloads to the
+    // libuv threadpool (UV_THREADPOOL_SIZE, default 4), so awaiting one record at a time leaves
+    // the other threads idle. Bounding the fan-out keeps every thread busy without materializing
+    // a whole page of decrypted blobs at once (which would defeat the per-record GC drop below).
+    RECORDS_DECRYPT_CONCURRENCY: z.coerce.number().int().positive().optional().default(10),
+
+    // Redis (system boundary)
+    NANGO_REDIS_URL: z.url().optional(),
+    NANGO_REDIS_HOST: z.string().optional(),
+    NANGO_REDIS_PORT: z.coerce.number().optional().default(6379),
+    NANGO_REDIS_AUTH: z.string().optional(),
+    // Optional AUTH username (e.g. IAM principal). Defaults to 'default' when a token is provided without a username.
+    NANGO_REDIS_USERNAME: z.string().optional(),
+    // Path to a file holding a short-lived auth token (e.g. IAM). Re-read on every (re)connect so rotated tokens work.
+    NANGO_REDIS_AUTH_TOKEN_FILE: z.string().optional(),
+
+    // Redis (customer boundary)
+    NANGO_CUSTOMER_REDIS_URL: z.url().optional(),
+    NANGO_CUSTOMER_REDIS_HOST: z.string().optional(),
+    NANGO_CUSTOMER_REDIS_PORT: z.coerce.number().optional().default(6379),
+    NANGO_CUSTOMER_REDIS_AUTH: z.string().optional(),
+    NANGO_CUSTOMER_REDIS_USERNAME: z.string().optional(),
+    NANGO_CUSTOMER_REDIS_AUTH_TOKEN_FILE: z.string().optional(),
+
+    // Render
+    RENDER_API_KEY: z.string().optional(),
+    RENDER_SERVICE_CREATION_MAX_PER_MINUTE: z.coerce.number().optional(),
+    RENDER_SERVICE_CREATION_MAX_PER_HOUR: z.coerce.number().optional(),
+    RENDER_WAIT_WHEN_THROTTLED_MS: z.coerce.number().default(1000),
+    IS_RENDER: z.stringbool().optional().default(false),
+
+    // Sentry
+    PUBLIC_SENTRY_KEY: z.string().optional(),
+
+    // Slack
+    NANGO_SLACK_INTEGRATION_KEY: z.string().optional().default('slack'),
+    NANGO_ADMIN_UUID: z.string().uuid().optional(),
+    // Breakglass only: set to false to let admins impersonate without passing their own MFA challenge
+    NANGO_IMPERSONATION_MFA_REQUIRED: z.stringbool().optional().default(true),
+
+    // Stripe
+    PUBLIC_STRIPE_KEY: z.string().optional(),
+    STRIPE_SECRET_KEY: z.string().optional(),
+    STRIPE_WEBHOOKS_SECRET: z.string().optional(),
+
+    // Plain (in-app support chat)
+    PLAIN_APP_ID: z.string().optional(),
+    PLAIN_HMAC_SECRET: z.string().optional(),
+
+    NANGO_AGENT_PLAYGROUND_MODEL: z.string().optional().default('gpt-6-luna'),
+    // Without it the Agent Playground answers from a mock model.
+    OPENAI_API_KEY: z.string().optional(),
+
+    // Internal API
+    NANGO_INTERNAL_API_KEY: z.string().optional(),
+
+    // Internal service auth (orchestrator / jobs). All optional so a default image is a no-op.
+    NANGO_INTERNAL_AUTH_TOKEN: z.string().optional(),
+    NANGO_INTERNAL_AUTH_SIGNING_KEY: z.string().optional(),
+    NANGO_INTERNAL_AUTH_RUNNER_NODE_TOKEN: z.string().optional(),
+    NANGO_INTERNAL_AUTH_RUNNER_PUBLIC_KEY: z.string().optional(),
+    NANGO_INTERNAL_AUTH_REQUIRED: z
+        .stringbool({ truthy: ['true'], falsy: ['false'] })
+        .optional()
+        .default(false),
+    NANGO_INTERNAL_AUTH_JOBS_KEY_ID: z.string().optional(),
+    NANGO_INTERNAL_AUTH_JOBS_PRIVATE_KEY: z.string().optional(),
+    NANGO_INTERNAL_AUTH_JOBS_PUBLIC_KEYS: internalAuthPublicKeysSchema('NANGO_INTERNAL_AUTH_JOBS_PUBLIC_KEYS'),
+    NANGO_INTERNAL_AUTH_SERVER_KEY_ID: z.string().optional(),
+    NANGO_INTERNAL_AUTH_SERVER_PRIVATE_KEY: z.string().optional(),
+    NANGO_INTERNAL_AUTH_SERVER_PUBLIC_KEYS: internalAuthPublicKeysSchema('NANGO_INTERNAL_AUTH_SERVER_PUBLIC_KEYS'),
+
+    // LIMITS
+    MAX_SYNCS_PER_CONNECTION: z.coerce.number().optional().default(100),
+
+    // Deploy
+    DEPLOY_BATCH_SIZE: z.coerce.number().int().positive().optional().default(5),
+    DEPLOY_LOCK_TTL_MS: z.coerce.number().int().positive().optional().default(600_000),
+
+    // Hosted telemetry
+    // Postgres storage for hosted telemetry on self-hosted and BYOC installations.
+    NANGO_HOSTED_TELEMETRY_POSTGRES_DATABASE_URL: z.url().optional(),
+    NANGO_HOSTED_TELEMETRY_POSTGRES_POOL_MAX: z.coerce.number().int().positive().optional().default(5),
+    NANGO_HOSTED_TELEMETRY_POSTGRES_SSL: z.stringbool().optional().default(false),
+    // Floored so a configuration mistake cannot drop the data an invoice depends on: a full quarter.
+    NANGO_HOSTED_TELEMETRY_POSTGRES_RETENTION_DAYS: z.coerce.number().int().min(90).optional().default(90),
+    NANGO_HOSTED_TELEMETRY_POSTGRES_PARTITION_INTERVAL_MS: z.coerce
+        .number()
+        .int()
+        .positive()
+        .max(6 * 3600 * 1000) // capped so tomorrow's partition is always created before midnight reaches it
+        .default(1 * 3600 * 1000),
+
+    // Audit
+    NANGO_AUDIT_TRANSPORT: z.enum(['direct', 'pubsub']).optional().default('direct'),
+    // The following are only considered in local, self-hosted and BYOC deployments that configure
+    // Postgres storage for the audit trail. The URL can point to the main database.
+    NANGO_AUDIT_POSTGRES_DATABASE_URL: z.url().optional(),
+    NANGO_AUDIT_POSTGRES_POOL_MAX: z.coerce.number().optional().default(5),
+    NANGO_AUDIT_POSTGRES_SSL: z.stringbool().optional().default(false),
+    NANGO_AUDIT_POSTGRES_RETENTION_DAYS: z.coerce.number().int().positive().optional().default(365),
+    NANGO_AUDIT_POSTGRES_PARTITION_INTERVAL_MS: z.coerce
+        .number()
+        .positive()
+        .max(6 * 3600 * 1000) // capped so tomorrow's partition is always created before midnight reaches it
+        .default(1 * 3600 * 1000),
+    // .int() because these go straight into SQS request fields, which reject a fractional value outright.
+    // One poll loop on purpose. Long polling returns as soon as a single message is available, so a batch
+    // only grows while an insert is in flight — extra loops would be parked in ReceiveMessage and take those
+    // arrivals one at a time, turning one insert into several. Raise it if queue depth starts building.
+    NANGO_AUDIT_CONSUMER_CONCURRENCY: z.coerce.number().int().min(1).optional().default(1),
+    NANGO_AUDIT_CONSUMER_MAX_MESSAGES: z.coerce.number().int().min(1).max(10).optional().default(10),
+    NANGO_AUDIT_CONSUMER_WAIT_TIME_SECONDS: z.coerce.number().int().min(0).max(20).optional().default(20),
+    NANGO_AUDIT_CONSUMER_VISIBILITY_TIMEOUT_SECONDS: z.coerce.number().int().min(10).max(43200).optional().default(30),
+
+    // PubSub
+    NANGO_PUBSUB_TRANSPORT: z.enum(['activemq', 'sns-sqs', 'migration', 'none']).optional().default('none'),
+    NANGO_PUBSUB_SNS_SQS_MAX_MESSAGES: z.coerce.number().min(1).max(10).optional().default(10),
+    NANGO_PUBSUB_SNS_SQS_WAIT_TIME_SECONDS: z.coerce.number().min(0).max(20).optional().default(20),
+    NANGO_PUBSUB_SNS_SQS_VISIBILITY_TIMEOUT_SECONDS: z.coerce.number().min(0).max(43200).optional().default(30),
+    NANGO_PUBSUB_SNS_SQS_CONFIG: z
+        .string()
+        .optional()
+        .default('{}')
+        .transform((s, ctx) => {
+            try {
+                return JSON.parse(s) as unknown;
+            } catch {
+                ctx.addIssue(`Invalid JSON in NANGO_PUBSUB_SNS_SQS_CONFIG`);
+                return z.NEVER;
+            }
+        })
+        .pipe(
+            z.object({
+                topicArns: z
+                    .partialRecord(
+                        z.enum(PUBSUB_SUBJECTS),
+                        z.string().regex(/^arn:aws(?:-[a-z0-9]+)*:sns:[a-z0-9-]+:\d{12}:.+$/, 'must be a valid AWS SNS topic ARN')
+                    )
+                    .optional()
+                    .default({}),
+                queueUrls: z
+                    .record(z.string(), z.url())
+                    .check((payload) => {
+                        const record = payload.value;
+                        const allowedSubjects = new Set<string>(PUBSUB_SUBJECTS);
+                        for (const key of Object.keys(record)) {
+                            const lastColon = key.lastIndexOf(':');
+                            if (lastColon < 0 || lastColon === key.length - 1) {
+                                payload.issues.push({
+                                    code: 'custom',
+                                    message: `Invalid queueUrls key "${key}": expected consumerGroup:subject (subject must be one of ${PUBSUB_SUBJECTS.join(', ')})`,
+                                    path: [key],
+                                    input: record[key]
+                                });
+                                continue;
+                            }
+                            const subject = key.slice(lastColon + 1);
+                            if (!allowedSubjects.has(subject)) {
+                                payload.issues.push({
+                                    code: 'custom',
+                                    message: `Invalid queueUrls key "${key}": subject after ':' must be one of ${PUBSUB_SUBJECTS.join(', ')}`,
+                                    path: [key],
+                                    input: record[key]
+                                });
+                            }
+                        }
+                    })
+                    .optional()
+                    .default({})
+            })
+        ),
+    NANGO_ACTIVEMQ_URL: z.string().optional().default('ws://localhost:61614/ws'), // string to allow multiple commas separated URLs for active/replica brokers
+    NANGO_ACTIVEMQ_USER: z.string().optional().default('admin'),
+    NANGO_ACTIVEMQ_PASSWORD: z.string().optional().default('admin'),
+    NANGO_ACTIVEMQ_CONNECT_TIMEOUT_MS: z.coerce.number().optional().default(10_000),
+
+    // Lambda
+    LAMBDA_KEEP_WARM_ENABLED: z.stringbool().optional().default(false),
+    LAMBDA_KEEP_WARM_ACCOUNT_AGE_MS: z.coerce.number().default(24 * 60 * 60 * 1000),
+    LAMBDA_KEEP_WARM_SUBSCRIBE_CONCURRENCY: z.coerce.number().min(1).max(10).optional().default(1),
+    LAMBDA_DEFAULT_TIMEOUT_BILLING_SECS: z.coerce.number().optional().default(10),
+    LAMBDA_ENABLED: z.stringbool().optional().default(false),
+    LAMBDA_DEFAULT_PREFIX: z.string().optional().default('nango-runner-function'),
+    LAMBDA_ECR_REGISTRY: z.string().optional(),
+    LAMBDA_RUNTIME: z.enum(['nodejs22.x', 'nodejs24.x']).optional().default('nodejs22.x'),
+    LAMBDA_EXECUTION_ROLE_ARN: z.string().optional(),
+    LAMBDA_DEFAULT_LOG_RETENTION_DAYS: z.coerce.number().optional().default(7),
+    LAMBDA_PERSIST_SERVICE_URL: z.url().optional(),
+    LAMBDA_JOBS_SERVICE_URL: z.url().optional(),
+    LAMBDA_PROVIDERS_URL: z.url().optional(),
+    LAMBDA_SUBNET_IDS: z
+        .string()
+        .transform((s, ctx) => {
+            try {
+                return JSON.parse(s);
+            } catch {
+                ctx.addIssue(`LAMBDA_SUBNET_IDS must be a valid JSON array of strings`);
+                return z.NEVER; // tells Zod to stop here and mark parse as failed
+            }
+        })
+        .pipe(z.array(z.string()))
+        .default([]),
+    LAMBDA_SECURITY_GROUP_IDS: z
+        .string()
+        .transform((s, ctx) => {
+            try {
+                return JSON.parse(s);
+            } catch {
+                ctx.addIssue(`LAMBDA_SECURITY_GROUP_IDS must be a valid JSON array of strings`);
+                return z.NEVER; // tells Zod to stop here and mark parse as failed
+            }
+        })
+        .pipe(z.array(z.string()))
+        .default([]),
+    LAMBDA_ARCHITECTURE: z.enum(['arm64', 'x86_64']).optional().default('arm64'),
+    LAMBDA_CREATE_TIMEOUT_SECS: z.coerce.number().optional().default(120),
+    LAMBDA_EXECUTION_TIMEOUT_SECS: z.coerce.number().optional().default(900),
+    LAMBDA_DEFAULT_MEMORY_MB: z.coerce.number().optional().default(512),
+    LAMBDA_DEFAULT_STORAGE_MB: z.coerce.number().optional().default(512),
+    LAMBDA_EXECUTION_INTERRUPT_AFTER_MULTIPLIER: z.coerce.number().optional().default(0.8), // interrupt execution after 80% of the timeout, to leave time for checkpointing and graceful shutdown
+    LAMBDA_EXECUTION_KILL_AFTER_MULTIPLIER: z.coerce.number().optional().default(0.95), // force kill the lambda after 95% of the timeout, to allow for runner-controlled shutdown
+    LAMBDA_FUNCTION_ALIAS: z.string().optional().default('latest'),
+    LAMBDA_MINIMUM_PROVISIONED_CONCURRENCY: z.coerce.number().optional().default(1),
+    LAMBDA_MAXIMUM_PROVISIONED_CONCURRENCY: z.coerce.number().optional().default(50),
+    LAMBDA_PROVISIONED_CONCURRENCY_SCALING_TARGET: z.coerce.number().optional().default(0.7),
+    LAMBDA_FAILURE_DESTINATION: z.string().optional(),
+    LAMBDA_PAYLOADS_BUCKET_NAME: z.string().optional(),
+    LAMBDA_PAYLOAD_MAX_SIZE_BYTES: z.coerce
+        .number()
+        .optional()
+        .default(1024 * 1024), // 1MB
+    LAMBDA_PAYLOAD_LIMIT_BYTES: z.coerce
+        .number()
+        .optional()
+        .default(1024 * 1024 * 100), // 100MB
+    LAMBDA_PAYLOAD_MAX_AGE_MS: z.coerce
+        .number()
+        .optional()
+        .default(1000 * 60 * 60 * 24 * 29), // 29 days (1 less than lifecycle policy)
+    // WEBHOOK DELIVERY CIRCUIT BREAKER
+    NANGO_WEBHOOK_TIMEOUT_MS: z.coerce.number().optional().default(20_000),
+    NANGO_WEBHOOK_RETRY_ATTEMPTS: z.coerce.number().optional().default(2),
+    NANGO_WEBHOOK_CIRCUIT_BREAKER_FAILURE_THRESHOLD: z.coerce.number().optional().default(5),
+    NANGO_WEBHOOK_CIRCUIT_BREAKER_WINDOW_SECS: z.coerce.number().optional().default(10),
+    NANGO_WEBHOOK_CIRCUIT_BREAKER_COOLDOWN_DURATION_SECS: z.coerce.number().optional().default(60),
+    NANGO_WEBHOOK_CIRCUIT_BREAKER_AUTO_RESET_SECS: z.coerce.number().optional().default(3600),
+
+    // WEBHOOK INGRESS
+    WEBHOOK_INGRESS_USE_DISPATCH_QUEUE: z.stringbool().optional().default(false),
+    NANGO_WEBHOOK_INGRESS_RATE_LIMIT_PER_MIN: z.coerce.number().min(0).optional().default(4000),
+    NANGO_WEBHOOK_INGRESS_RATE_LIMIT_ENFORCE: z.stringbool().optional().default(false),
+
+    // TASK DISPATCH QUEUE
+    NANGO_TASK_DISPATCH_QUEUE_URL: z.url().optional(),
+    NANGO_TASK_DISPATCH_DLQ_URL: z.url().optional(),
+    NANGO_TASK_DISPATCH_MAX_MESSAGES: z.coerce.number().min(1).max(10).optional().default(10),
+    NANGO_TASK_DISPATCH_WAIT_TIME_SECONDS: z.coerce.number().min(0).max(20).optional().default(20),
+    NANGO_TASK_DISPATCH_VISIBILITY_TIMEOUT_SECONDS: z.coerce.number().min(0).max(43200).optional().default(30),
+    // Number of parallel SQS poll loops. Each in-flight batch holds one orchestrator DB session,
+    // so peak orchestrator connections from webhook dispatch ≈ jobs_replicas × this. Keep it well
+    // under ORCHESTRATOR_DB_POOL_MAX so bulk webhook ingress can't starve the orchestrator's core work.
+    NANGO_TASK_DISPATCH_CONSUMER_CONCURRENCY: z.coerce.number().min(1).optional().default(5),
+    NANGO_TASK_DISPATCH_PUBLISH_BATCH_SIZE: z.coerce.number().min(1).max(10).optional().default(10),
+    NANGO_TASK_DISPATCH_PUBLISH_CONCURRENCY: z.coerce.number().min(1).optional().default(10),
+    NANGO_TASK_DISPATCH_MAX_AGE_SECONDS: z.coerce.number().min(0).optional().default(7200),
+    NANGO_TASK_DISPATCH_RATE_LIMIT_THROTTLE_MAX_MS: z.coerce.number().min(0).optional().default(60_000),
+    NANGO_TASK_DISPATCH_DEFER_JITTER_RATIO: z.coerce.number().min(0).max(1).optional().default(0.2),
+    NANGO_TASK_DISPATCH_TASK_CAP_DEFER_MS: z.coerce.number().min(0).optional().default(15_000),
+
+    // Sandboxes
+    SANDBOX_PROVIDER: z.enum(['docker', 'agentcore']).optional(),
+    AGENTCORE_RUNTIME_ARN: z.string().min(1).optional(),
+    AGENTCORE_RUNTIME_QUALIFIER: z.string().min(1).default('DEFAULT'),
+
+    // Internal mTLS. The client certificate presented on service-to-service calls; enforcement happens
+    // outside the app (load balancer). Each asset is inline PEM, base64 PEM, or a file path via _FILE.
+    NANGO_INTERNAL_TLS_CERT: z.string().optional(),
+    NANGO_INTERNAL_TLS_CERT_FILE: z.string().optional(),
+    NANGO_INTERNAL_TLS_KEY: z.string().optional(),
+    NANGO_INTERNAL_TLS_KEY_FILE: z.string().optional(),
+    NANGO_INTERNAL_TLS_CA: z.string().optional(),
+    NANGO_INTERNAL_TLS_CA_FILE: z.string().optional(),
+    NANGO_INTERNAL_TLS_KEY_PASSPHRASE: z.string().optional(),
+
+    // Feature Flags
+    NANGO_FLAG_PROVIDER: z.enum(['noop', 'unleash', 'env']).optional().default('noop'),
+    NANGO_UNLEASH_URL: z.url().optional(),
+    NANGO_UNLEASH_API_TOKEN: z.string().optional(),
+    NANGO_UNLEASH_APP_NAME: z.string().optional().default('nango'),
+    NANGO_UNLEASH_REFRESH_INTERVAL_MS: z.coerce.number().optional().default(30_000),
+    NANGO_UNLEASH_INIT_TIMEOUT_MS: z.coerce.number().optional().default(10_000),
+
+    // ----- Others
+    SERVER_RUN_MODE: z.enum(['DOCKERIZED', '']).optional(),
+    NANGO_CLOUD: z.stringbool().optional().default(false),
+    NANGO_ENTERPRISE: z.stringbool().optional().default(false),
+    NANGO_TELEMETRY_SDK: z.stringbool().optional().default(false),
+    NANGO_METRICS_INCLUDE_PROVIDER_CONFIG_KEY: z.stringbool().optional().default(false),
+    NANGO_ADMIN_KEY: z.string().optional(),
+    NANGO_INTEGRATIONS_FULL_PATH: z.string().optional(),
+    LOG_LEVEL: z.enum(['info', 'debug', 'warn', 'error']).optional().default('info')
+});
+
+/** SPKI prefix length for an Ed25519 public key (RFC 8410). The raw key is the remaining 32 bytes. */
+const ED25519_SPKI_PREFIX_LEN = 12;
+
+/** Env files often store PEM with escaped newlines. */
+export function normalizePem(value: string): string {
+    const trimmed = value.trim();
+    return trimmed.includes('\\n') ? trimmed.replace(/\\n/g, '\n') : trimmed;
+}
+
+function presentEnv(value: string | undefined): string | undefined {
+    const trimmed = value?.trim();
+    return trimmed ? trimmed : undefined;
+}
+
+function ed25519RawPublicKey(privatePem: string): string | null {
+    try {
+        const privateKey = createPrivateKey(privatePem);
+        if (privateKey.asymmetricKeyType !== 'ed25519') {
+            return null;
+        }
+        const spki = Buffer.from(createPublicKey(privateKey).export({ type: 'spki', format: 'der' }));
+        return spki.subarray(ED25519_SPKI_PREFIX_LEN).toString('base64url');
+    } catch {
+        return null;
+    }
+}
+
+function checkInternalAuthKeyPair(
+    value: object,
+    push: (issue: { code: 'custom'; message: string; path: string[]; input: unknown }) => void,
+    names: { privateName: string; keyIdName: string; publicName: string }
+): void {
+    const record = value as Record<string, unknown>;
+    const privateRaw = record[names.privateName];
+    const keyIdRaw = record[names.keyIdName];
+    const publicRaw = record[names.publicName];
+    const privateKey = presentEnv(typeof privateRaw === 'string' ? privateRaw : undefined);
+    const keyId = presentEnv(typeof keyIdRaw === 'string' ? keyIdRaw : undefined);
+    const publicKeys = Array.isArray(publicRaw) ? (publicRaw as InternalAuthPublicKey[]) : undefined;
+
+    if (!privateKey) {
+        return;
+    }
+
+    if (!privateKey.includes('BEGIN PRIVATE KEY') || !ed25519RawPublicKey(normalizePem(privateKey))) {
+        push({
+            code: 'custom',
+            message: `${names.privateName} must be an unencrypted Ed25519 PKCS8 PEM`,
+            path: [names.privateName],
+            input: privateRaw
+        });
+    }
+
+    if (!keyId) {
+        push({
+            code: 'custom',
+            message: `${names.keyIdName} is required when ${names.privateName} is set`,
+            path: [names.keyIdName],
+            input: keyIdRaw
+        });
+        return;
+    }
+
+    if (!publicKeys) {
+        return;
+    }
+
+    const match = publicKeys.find((entry) => entry.kid === keyId);
+    if (!match) {
+        push({
+            code: 'custom',
+            message: `${names.publicName} must include ${keyId} when ${names.privateName} is set`,
+            path: [names.publicName],
+            input: publicRaw
+        });
+        return;
+    }
+
+    const raw = ed25519RawPublicKey(normalizePem(privateKey));
+    if (raw && match.publicKey !== raw) {
+        push({
+            code: 'custom',
+            message: `${names.publicName} entry ${keyId} does not match ${names.privateName}`,
+            path: [names.publicName],
+            input: publicRaw
+        });
+    }
+}
+
+export const ENVS = ENVS_SHAPE.check((ctx) => {
+    if (ctx.value.SIGNUP_AD_CONTEXT_ENABLED && !ctx.value.SIGNUP_AD_CONTEXT_COOKIE_NAME) {
+        ctx.issues.push({
+            code: 'custom',
+            message: 'SIGNUP_AD_CONTEXT_COOKIE_NAME is required when SIGNUP_AD_CONTEXT_ENABLED is true',
+            path: ['SIGNUP_AD_CONTEXT_COOKIE_NAME'],
+            input: ctx.value.SIGNUP_AD_CONTEXT_COOKIE_NAME
+        });
+    }
+
+    // EMAIL_HTTP_URL on its own selects the HTTP email provider, which cannot send without a body
+    // template. Fail here so a half-configured provider surfaces at startup instead of on the
+    // first email, and keep the error pointed at the var that is actually missing.
+    if (ctx.value.EMAIL_HTTP_URL && ctx.value.EMAIL_HTTP_BODY === undefined) {
+        ctx.issues.push({
+            code: 'custom',
+            message: 'EMAIL_HTTP_BODY is required when EMAIL_HTTP_URL is set',
+            path: ['EMAIL_HTTP_BODY'],
+            input: ctx.value.EMAIL_HTTP_BODY
+        });
+    }
+
+    const pushIssue = (issue: { code: 'custom'; message: string; path: string[]; input: unknown }) => {
+        ctx.issues.push(issue);
+    };
+    checkInternalAuthKeyPair(ctx.value, pushIssue, {
+        privateName: 'NANGO_INTERNAL_AUTH_JOBS_PRIVATE_KEY',
+        keyIdName: 'NANGO_INTERNAL_AUTH_JOBS_KEY_ID',
+        publicName: 'NANGO_INTERNAL_AUTH_JOBS_PUBLIC_KEYS'
+    });
+    checkInternalAuthKeyPair(ctx.value, pushIssue, {
+        privateName: 'NANGO_INTERNAL_AUTH_SERVER_PRIVATE_KEY',
+        keyIdName: 'NANGO_INTERNAL_AUTH_SERVER_KEY_ID',
+        publicName: 'NANGO_INTERNAL_AUTH_SERVER_PUBLIC_KEYS'
+    });
+
+    const jobsKeys = ctx.value.NANGO_INTERNAL_AUTH_JOBS_PUBLIC_KEYS;
+    const serverKeys = ctx.value.NANGO_INTERNAL_AUTH_SERVER_PUBLIC_KEYS;
+    const jobsKids = new Set(jobsKeys.map((entry) => entry.kid));
+    if (serverKeys.some((entry) => jobsKids.has(entry.kid))) {
+        ctx.issues.push({
+            code: 'custom',
+            message: 'NANGO_INTERNAL_AUTH_SERVER_PUBLIC_KEYS reuses a kid from NANGO_INTERNAL_AUTH_JOBS_PUBLIC_KEYS',
+            path: ['NANGO_INTERNAL_AUTH_SERVER_PUBLIC_KEYS'],
+            input: ctx.value.NANGO_INTERNAL_AUTH_SERVER_PUBLIC_KEYS
+        });
+    }
+});
+
+export function parseEnvs<T extends z.ZodObject<any>>(schema: T, envs: Record<string, unknown> = process.env): z.ZodSafeParseSuccess<z.infer<T>>['data'] {
+    const res = schema.safeParse(envs);
+    if (!res.success) {
+        throw new Error(`Missing or invalid env vars: ${zodErrorToString(res.error.issues)}`);
+    }
+
+    return res.data;
+}
+
+function zodErrorToString(issues: z.core.$ZodIssue[]) {
+    return issues
+        .map((issue) => {
+            return `${issue.path.join('')} (${issue.code} ${issue.message})`;
+        })
+        .join(', ');
+}

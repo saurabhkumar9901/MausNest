@@ -1,0 +1,157 @@
+import { ArrowUpRight, ExternalLink } from 'lucide-react';
+import { useRef } from 'react';
+import { Helmet } from 'react-helmet';
+
+import { AlertButton, Button } from '@nangohq/design-system';
+
+import { AlertButtonLink } from '@/components/ui/AlertButtonLink';
+import { Separator } from '@/components/ui/Separator';
+import { OverdueInvoiceAlert } from '@/features/Billing/OverdueInvoiceAlert';
+import { usePlanOverrideStore } from '@/features/planOverride';
+import { usePermissions } from '@/hooks/usePermissions';
+import { useApiGetBillingUsage, useApiGetOverdueInvoices, useApiGetPlans, useApiGetUsage, useCurrentPlan } from '@/hooks/usePlan';
+import { useScrollToHash } from '@/hooks/useScrollToHash';
+import { useStripePaymentMethods } from '@/hooks/useStripe';
+import { useStore } from '@/store';
+import { track } from '@/utils/analytics';
+import { billedUsageMetrics, getAggregateUsageState } from '@/utils/usage';
+import DashboardLayout from '../../../layout/DashboardLayout';
+import { BillingHeaderAction } from './components/BillingHeaderAction';
+import { Payment } from './components/Payment';
+import { PaymentMethodDialog } from './components/PaymentMethodDialog';
+import { Plans } from './components/Plans';
+import { PlanTransitionBanner } from './components/PlanTransitionBanner';
+import { PlanTransitionNotice } from './components/PlanTransitionNotice';
+import { ScheduledPlanChangeAlert } from './components/ScheduledPlanChangeAlert';
+import { SpendAlerts } from './components/SpendAlerts';
+import { Summary } from './components/Summary';
+import { Usage } from './components/Usage';
+import { UsageLimitBanner } from './components/UsageLimitBanner';
+import { hasMonthlySpend, showsSummaryStrip } from './planVisibility';
+import { usePlanTransition } from './usePlanTransition';
+
+export const TeamBilling: React.FC = () => {
+    const { can } = usePermissions();
+    const canManageBilling = can('account:billing:payment_methods:create');
+    const usageLimitOverride = usePlanOverrideStore((s) => s.usageLimitOverride);
+
+    // Hidden for legacy, enterprise and free-uncapped accounts. Checked here as well as inside
+    // `Summary` so the section's separator goes with it. Shown while the plan is still loading, but
+    // not once the query has settled without one — otherwise a failed load leaves a stuck skeleton.
+    const env = useStore((state) => state.env);
+    const { data: environmentData, isPending: isPlanPending, isError: didPlanFail } = useCurrentPlan(env);
+    // Plan titles come from `/api/v1/plans`; with no titles the strip can only show raw Orb codes,
+    // so a failed load hides the section rather than leaking them or holding a skeleton forever.
+    const { isPending: arePlansPending, isError: didPlanListFail } = useApiGetPlans(env);
+
+    const transition = usePlanTransition();
+    const showSummary = !didPlanListFail && (isPlanPending || showsSummaryStrip(environmentData?.plan, transition !== null));
+
+    // A failed refetch keeps the previous plan cached, so the error is checked rather than trusting stale data.
+    const showSpendAlerts = canManageBilling && !didPlanFail && hasMonthlySpend(environmentData?.plan) && !!environmentData?.plan?.orb_subscription_id;
+
+    // The cap warning belongs with the plan, not the usage table, so it sits above the divider.
+    // Free is the only capped plan, and the sidebar alert already runs this query app-wide.
+    const { data: caps, isPending: areCapsPending } = useApiGetUsage(env);
+    const billedMetrics = billedUsageMetrics(environmentData?.plan);
+
+    const overdueOverride = usePlanOverrideStore((s) => s.overdueOverride);
+    // Shares <Payment/>'s unfiltered key, so enabling it alongside that section adds no request.
+    // The dev override needs a real portal URL or its previewed "View invoices" link opens nothing.
+    const { data: billingUsage, isPending: isBillingUsagePending } = useApiGetBillingUsage(env, undefined, {
+        enabled: canManageBilling || overdueOverride
+    });
+    const { isPending: arePaymentMethodsPending } = useStripePaymentMethods(env);
+
+    // Owned here rather than by <Usage/> so a usage outage can't hide a payment warning, and so it
+    // sits above the cap warning: money owed outranks a limit being approached.
+    const { data: overdue, isPending: isOverduePending } = useApiGetOverdueInvoices(env, environmentData?.plan, billingUsage?.data.customer.portalUrl);
+    const overdueBanner = overdue?.data.hasOverdue && (
+        <OverdueInvoiceAlert size="wide" canManageBilling={canManageBilling}>
+            {overdue.data.portalUrl && (
+                <AlertButtonLink to={overdue.data.portalUrl} target="_blank" rel="noopener noreferrer" onClick={() => track('billing:invoice_link_click', {})}>
+                    View invoices <ExternalLink />
+                </AlertButtonLink>
+            )}
+            <PaymentMethodDialog replace>
+                <AlertButton onClick={() => track('billing:payment_method_button_click', {})}>
+                    Edit payment method <ArrowUpRight />
+                </AlertButton>
+            </PaymentMethodDialog>
+        </OverdueInvoiceAlert>
+    );
+
+    const scrollRef = useRef<HTMLDivElement>(null);
+    // The banners and summary strip sit above the anchors, `Payment` below all of them, so every
+    // one of these moves the height. `Payment` renders only for billing managers, so only they wait.
+    const pageHeightSettled =
+        !isPlanPending &&
+        !arePlansPending &&
+        !areCapsPending &&
+        !isOverduePending &&
+        (!canManageBilling || (!isBillingUsagePending && !arePaymentMethodsPending));
+    useScrollToHash(scrollRef, pageHeightSettled);
+
+    // Full-width page shell keeps chrome consistent with the other dashboard pages, but `centered`
+    // caps the content: the usage charts have a fixed height, so unbounded width stretches them to an
+    // unreadable aspect ratio on wide screens.
+    return (
+        <DashboardLayout ref={scrollRef} fullWidth centered title="Billing & usage" titleActions={<BillingHeaderAction />}>
+            <Helmet>
+                <title>Billing & usage - Nango</title>
+            </Helmet>
+            <div className="flex flex-col gap-8">
+                {/* Legacy, enterprise and free-uncapped get no strip, but can still owe an invoice. */}
+                <div className="flex flex-col gap-3 empty:hidden">
+                    {overdueBanner}
+                    {transition && <PlanTransitionBanner transition={transition} />}
+                    {showSummary && <UsageLimitBanner state={usageLimitOverride ?? getAggregateUsageState(caps?.data ?? {}, billedMetrics)} />}
+                </div>
+                {showSummary && (
+                    <>
+                        <div id="summary">
+                            <Summary />
+                        </div>
+                        <Separator />
+                    </>
+                )}
+                <div id="usage">
+                    <Usage />
+                </div>
+                {showSpendAlerts && (
+                    <>
+                        <Separator />
+                        <div id="spend-alerts">
+                            <SpendAlerts />
+                        </div>
+                    </>
+                )}
+                <Separator />
+                <div id="plans" className="flex flex-col gap-4">
+                    <div className="flex items-center justify-between gap-4">
+                        <span className="text-text-strong text-body-medium-medium">Plans</span>
+                        <Button asChild variant="link-accent">
+                            <a href="https://nango.dev/pricing" target="_blank" rel="noopener noreferrer">
+                                View full pricing detail
+                                <ExternalLink />
+                            </a>
+                        </Button>
+                    </div>
+                    {/* Outside the scroll container below, so the full-width alert doesn't scroll with the plan cards. */}
+                    {transition ? <PlanTransitionNotice transition={transition} /> : <ScheduledPlanChangeAlert />}
+                    <div className="w-full overflow-x-auto">
+                        <Plans />
+                    </div>
+                </div>
+                {canManageBilling && (
+                    <>
+                        <Separator />
+                        <div id="payment-and-invoices">
+                            <Payment />
+                        </div>
+                    </>
+                )}
+            </div>
+        </DashboardLayout>
+    );
+};

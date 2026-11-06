@@ -1,0 +1,611 @@
+import * as uuid from 'uuid';
+
+import { isAccountScopeSelector } from '@nangohq/authz';
+import { Err, Ok, PBKDF2_ITERATIONS, stringToHash } from '@nangohq/utils';
+
+import { getEncryptionManager, pbkdf2 } from '../utils/encryption.manager.js';
+import { NangoError } from '../utils/error.js';
+import { createSandboxSigningSecret, encryptSandboxSigningSecret } from './sandbox-api-key.js';
+
+import type { EncryptionManager } from '../utils/encryption.manager.js';
+import type { AccountApiKeyScope, CustomerKeyScope, DBCustomerKey, DBCustomerKeyRelation, Result } from '@nangohq/types';
+import type { Knex } from 'knex';
+
+const CUSTOMER_KEYS_TABLE = 'customer_keys';
+const CUSTOMER_KEYS_RELATIONS_TABLE = 'customer_keys_relations';
+const webhookSigningKeyCache = new Map<number, { key: string; committedAt: number; expiresAt: number }>();
+const WEBHOOK_SIGNING_KEY_CACHE_TTL_MS = 300_000;
+// Internal safety limits — not product constraints, just protection against unbounded key creation.
+// Can be raised without migration if needed.
+export const MAX_API_KEYS_PER_ENV = 50;
+export const MAX_API_KEYS_PER_ACCOUNT = 50;
+
+export type CustomerKeyErrorCode = 'duplicate_api_key' | 'resource_capped' | 'no_such_api_secret' | 'no_webhook_signing_key' | 'multiple_webhook_signing_keys';
+
+export class CustomerKeyError extends Error {
+    constructor(
+        public readonly code: CustomerKeyErrorCode,
+        public readonly payload: Record<string, unknown> = {}
+    ) {
+        super(code);
+    }
+}
+
+/** What the audit trail needs to name a key: the public identifier and its label, never its secret. */
+export type ApiKeyRef = Pick<DBCustomerKey, 'uuid' | 'display_name'>;
+
+type EnvironmentKeyScope = {
+    type: 'environment';
+    environmentId: number;
+    accountId: number;
+};
+
+type AccountKeyScope = {
+    type: 'account';
+    accountId: number;
+};
+
+export type CustomerKeySearch =
+    | (EnvironmentKeyScope & { keyId?: never; keyUuid?: never; displayName?: string | undefined })
+    | (EnvironmentKeyScope & { keyId: number; keyUuid?: never; displayName?: never })
+    | (EnvironmentKeyScope & { keyId?: never; keyUuid: string; displayName?: never })
+    | (AccountKeyScope & { keyId?: never; keyUuid?: never })
+    | (AccountKeyScope & { keyId: number; keyUuid?: never })
+    | (AccountKeyScope & { keyId?: never; keyUuid: string });
+
+type SafeCustomerKey = Omit<
+    DBCustomerKey,
+    'secret' | 'iv' | 'tag' | 'hashed' | 'sandbox_signing_secret' | 'sandbox_signing_secret_iv' | 'sandbox_signing_secret_tag'
+>;
+
+const SAFE_CUSTOMER_KEY_COLUMNS = [
+    'id',
+    'uuid',
+    'account_id',
+    'key_type',
+    'display_name',
+    'scopes',
+    'last_used_at',
+    'deleted_at',
+    'created_at',
+    'updated_at'
+] as const satisfies readonly (keyof SafeCustomerKey)[];
+
+class CustomerKeyService {
+    private async acquireNameLock(trx: Knex, accountId: number, keyType: string): Promise<void> {
+        const lockKey = stringToHash(`customer_key_name:${accountId}:${keyType}`);
+        await trx.raw(`SELECT pg_advisory_xact_lock(?) as "lock_customer_key_name_${keyType}"`, [lockKey]);
+    }
+
+    private customerKeysQuery(trx: Knex, filter: CustomerKeySearch) {
+        let query = trx<DBCustomerKey>(CUSTOMER_KEYS_TABLE).where(`${CUSTOMER_KEYS_TABLE}.key_type`, 'api').whereNull(`${CUSTOMER_KEYS_TABLE}.deleted_at`);
+
+        switch (filter.type) {
+            case 'environment': {
+                query = query
+                    .join(CUSTOMER_KEYS_RELATIONS_TABLE, `${CUSTOMER_KEYS_RELATIONS_TABLE}.customer_key_id`, `${CUSTOMER_KEYS_TABLE}.id`)
+                    .where(`${CUSTOMER_KEYS_RELATIONS_TABLE}.entity_type`, 'environment')
+                    .where(`${CUSTOMER_KEYS_RELATIONS_TABLE}.entity_id`, filter.environmentId)
+                    .where(`${CUSTOMER_KEYS_TABLE}.account_id`, filter.accountId);
+                if (filter.displayName !== undefined) {
+                    query = query.where(`${CUSTOMER_KEYS_TABLE}.display_name`, filter.displayName);
+                }
+                break;
+            }
+
+            case 'account': {
+                query = query
+                    .where(`${CUSTOMER_KEYS_TABLE}.account_id`, filter.accountId)
+                    .whereRaw(`EXISTS (SELECT 1 FROM unnest(COALESCE(${CUSTOMER_KEYS_TABLE}.scopes, ARRAY[]::TEXT[])) AS scope WHERE scope LIKE 'account:%')`);
+                break;
+            }
+        }
+
+        if (filter.keyId !== undefined) {
+            query = query.where(`${CUSTOMER_KEYS_TABLE}.id`, filter.keyId);
+        }
+        if (filter.keyUuid !== undefined) {
+            query = query.where(`${CUSTOMER_KEYS_TABLE}.uuid`, filter.keyUuid);
+        }
+
+        return query;
+    }
+
+    /**
+     * Omit `environmentId` for an account-level key: it gets no environment relation, and no sandbox
+     * signing secret since sandbox tokens are always minted for a specific environment.
+     */
+    private async insertApiKey(
+        trx: Knex,
+        {
+            accountId,
+            environmentId,
+            displayName,
+            scopes
+        }: {
+            accountId: number;
+            environmentId?: number;
+            displayName: string;
+            scopes: string[];
+        }
+    ): Promise<Result<DBCustomerKey>> {
+        try {
+            const plainText = uuid.v4();
+
+            const hashed = await this.hashSecret(plainText);
+            if (hashed.isErr()) {
+                return Err(hashed.error);
+            }
+
+            const sandboxSigningSecret =
+                environmentId === undefined
+                    ? { sandbox_signing_secret: null, sandbox_signing_secret_iv: null, sandbox_signing_secret_tag: null }
+                    : encryptSandboxSigningSecret(createSandboxSigningSecret());
+
+            const customerKey = {
+                account_id: accountId,
+                key_type: 'api' as const,
+                display_name: displayName,
+                scopes,
+                secret: plainText,
+                iv: '',
+                tag: '',
+                hashed: hashed.value,
+                ...sandboxSigningSecret,
+                last_used_at: null,
+                deleted_at: null
+            } satisfies Partial<DBCustomerKey>;
+
+            const encrypted = getEncryptionManager().encryptAPISecret(
+                customerKey as Parameters<EncryptionManager['encryptAPISecret']>[0]
+            ) as typeof customerKey;
+
+            const [row] = await trx<DBCustomerKey>(CUSTOMER_KEYS_TABLE).insert(encrypted).returning('*');
+            if (!row) {
+                return Err(new NangoError('impossible_condition'));
+            }
+
+            if (environmentId !== undefined) {
+                await trx<DBCustomerKeyRelation>(CUSTOMER_KEYS_RELATIONS_TABLE).insert({
+                    customer_key_id: row.id,
+                    entity_type: 'environment',
+                    entity_id: environmentId
+                });
+            }
+
+            row.secret = plainText; // Callers expect unencrypted secret.
+            return Ok(row);
+        } catch (err) {
+            return Err(err);
+        }
+    }
+
+    public async createAccountApiKey(
+        trx: Knex,
+        {
+            accountId,
+            displayName,
+            scopes
+        }: {
+            accountId: number;
+            displayName: string;
+            scopes: AccountApiKeyScope[];
+        }
+    ): Promise<Result<DBCustomerKey>> {
+        if (scopes.length === 0 || scopes.some((scope) => !isAccountScopeSelector(scope))) {
+            return Err(new Error('Account API keys require at least one valid account scope'));
+        }
+
+        try {
+            const created = await trx.transaction(async (innerTrx) => {
+                await this.acquireNameLock(innerTrx, accountId, 'api');
+
+                const accountKeyQuery = this.customerKeysQuery(innerTrx, { type: 'account', accountId });
+
+                const existing = await accountKeyQuery.clone().select('id').where('display_name', displayName).first();
+                if (existing) {
+                    throw new CustomerKeyError('duplicate_api_key', { display_name: displayName });
+                }
+
+                const count = await accountKeyQuery.clone().count<{ total: string }[]>('* as total').first();
+                if (count && Number(count.total) >= MAX_API_KEYS_PER_ACCOUNT) {
+                    throw new CustomerKeyError('resource_capped', { max: MAX_API_KEYS_PER_ACCOUNT });
+                }
+
+                const inserted = await this.insertApiKey(innerTrx, { accountId, displayName, scopes });
+                if (inserted.isErr()) {
+                    throw inserted.error;
+                }
+                return inserted.value;
+            });
+
+            return Ok(created);
+        } catch (err) {
+            return Err(err);
+        }
+    }
+
+    public async createApiKey(
+        trx: Knex,
+        {
+            accountId,
+            environmentId,
+            displayName,
+            scopes = ['environment:*']
+        }: {
+            accountId: number;
+            environmentId: number;
+            displayName: string;
+            scopes?: string[];
+        }
+    ): Promise<Result<DBCustomerKey>> {
+        try {
+            const created = await trx.transaction(async (innerTrx) => {
+                await this.acquireNameLock(innerTrx, accountId, 'api');
+
+                // Check name uniqueness within the environment
+                const existing = await innerTrx<DBCustomerKey>(CUSTOMER_KEYS_TABLE)
+                    .select(`${CUSTOMER_KEYS_TABLE}.id`)
+                    .join(CUSTOMER_KEYS_RELATIONS_TABLE, `${CUSTOMER_KEYS_RELATIONS_TABLE}.customer_key_id`, `${CUSTOMER_KEYS_TABLE}.id`)
+                    .where(`${CUSTOMER_KEYS_TABLE}.key_type`, 'api')
+                    .where(`${CUSTOMER_KEYS_TABLE}.display_name`, displayName)
+                    .where(`${CUSTOMER_KEYS_RELATIONS_TABLE}.entity_type`, 'environment')
+                    .where(`${CUSTOMER_KEYS_RELATIONS_TABLE}.entity_id`, environmentId)
+                    .whereNull(`${CUSTOMER_KEYS_TABLE}.deleted_at`)
+                    .first();
+
+                if (existing) {
+                    throw new CustomerKeyError('duplicate_api_key', { display_name: displayName });
+                }
+
+                // Check max keys per environment
+                const count = await innerTrx<DBCustomerKey>(CUSTOMER_KEYS_TABLE)
+                    .join(CUSTOMER_KEYS_RELATIONS_TABLE, `${CUSTOMER_KEYS_RELATIONS_TABLE}.customer_key_id`, `${CUSTOMER_KEYS_TABLE}.id`)
+                    .where(`${CUSTOMER_KEYS_TABLE}.key_type`, 'api')
+                    .where(`${CUSTOMER_KEYS_RELATIONS_TABLE}.entity_type`, 'environment')
+                    .where(`${CUSTOMER_KEYS_RELATIONS_TABLE}.entity_id`, environmentId)
+                    .whereNull(`${CUSTOMER_KEYS_TABLE}.deleted_at`)
+                    .count('* as total')
+                    .first();
+                if (count && Number(count['total']) >= MAX_API_KEYS_PER_ENV) {
+                    throw new CustomerKeyError('resource_capped', { max: MAX_API_KEYS_PER_ENV });
+                }
+
+                const inserted = await this.insertApiKey(innerTrx, {
+                    accountId,
+                    environmentId,
+                    displayName,
+                    scopes
+                });
+                if (inserted.isErr()) {
+                    throw inserted.error;
+                }
+
+                return inserted.value;
+            });
+
+            return Ok(created);
+        } catch (err) {
+            return Err(err);
+        }
+    }
+
+    /**
+     * Looks up customer keys by account or environment scope, optionally narrowed to a specific
+     * key (`keyId`/`keyUuid`) or display name. Sensitive fields are replaced with placeholders unless `withSecrets` is set.
+     */
+    public async search(
+        trx: Knex,
+        filter: CustomerKeySearch,
+        { withSecrets }: { withSecrets: boolean } = { withSecrets: false }
+    ): Promise<Result<DBCustomerKey[]>> {
+        try {
+            const query = this.customerKeysQuery(trx, filter).orderBy(`${CUSTOMER_KEYS_TABLE}.display_name`, 'asc');
+
+            if (withSecrets) {
+                const rows = await query.select<DBCustomerKey[]>(`${CUSTOMER_KEYS_TABLE}.*`);
+                const decrypted = rows.map(
+                    (row) => getEncryptionManager().decryptAPISecret(row as Parameters<EncryptionManager['decryptAPISecret']>[0]) as DBCustomerKey
+                );
+                return Ok(decrypted);
+            }
+
+            const rows = await query.select<SafeCustomerKey[]>(SAFE_CUSTOMER_KEY_COLUMNS.map((column) => `${CUSTOMER_KEYS_TABLE}.${column}`));
+            const withPlaceholders = rows.map((row) => ({
+                ...row,
+                secret: '',
+                iv: '',
+                tag: '',
+                hashed: '',
+                sandbox_signing_secret: null,
+                sandbox_signing_secret_iv: null,
+                sandbox_signing_secret_tag: null
+            }));
+            return Ok(withPlaceholders);
+        } catch (err) {
+            return Err(err);
+        }
+    }
+
+    public async createWebhookSigningKey(
+        trx: Knex,
+        {
+            accountId,
+            environmentId,
+            secret: plainText = uuid.v4()
+        }: {
+            accountId: number;
+            environmentId: number;
+            secret?: string;
+        }
+    ): Promise<Result<DBCustomerKey>> {
+        if (plainText.trim().length === 0) {
+            return Err(new Error('Webhook signing key cannot be blank'));
+        }
+
+        try {
+            const hashed = await this.hashSecret(plainText);
+            if (hashed.isErr()) {
+                return Err(hashed.error);
+            }
+
+            const customerKey = {
+                account_id: accountId,
+                key_type: 'webhook_signing' as const,
+                display_name: 'Webhook signing',
+                scopes: null,
+                secret: plainText,
+                iv: '',
+                tag: '',
+                hashed: hashed.value,
+                last_used_at: null,
+                deleted_at: null
+            } satisfies Partial<DBCustomerKey>;
+
+            const encrypted = getEncryptionManager().encryptAPISecret(
+                customerKey as Parameters<EncryptionManager['encryptAPISecret']>[0]
+            ) as typeof customerKey;
+
+            const [created] = await trx<DBCustomerKey>(CUSTOMER_KEYS_TABLE).insert(encrypted).returning('*');
+            if (!created) {
+                return Err(new NangoError('impossible_condition'));
+            }
+
+            await trx<DBCustomerKeyRelation>(CUSTOMER_KEYS_RELATIONS_TABLE).insert({
+                customer_key_id: created.id,
+                entity_type: 'environment',
+                entity_id: environmentId
+            });
+
+            created.secret = plainText; // Callers expect unencrypted secret.
+            return Ok(created);
+        } catch (err) {
+            return Err(err);
+        }
+    }
+
+    private webhookSigningKeyForEnv(trx: Knex, envId: number) {
+        return trx<DBCustomerKey>(CUSTOMER_KEYS_TABLE)
+            .select(`${CUSTOMER_KEYS_TABLE}.*`)
+            .join(CUSTOMER_KEYS_RELATIONS_TABLE, `${CUSTOMER_KEYS_RELATIONS_TABLE}.customer_key_id`, `${CUSTOMER_KEYS_TABLE}.id`)
+            .where(`${CUSTOMER_KEYS_TABLE}.key_type`, 'webhook_signing')
+            .where(`${CUSTOMER_KEYS_RELATIONS_TABLE}.entity_type`, 'environment')
+            .where(`${CUSTOMER_KEYS_RELATIONS_TABLE}.entity_id`, envId)
+            .whereNull(`${CUSTOMER_KEYS_TABLE}.deleted_at`);
+    }
+
+    private cacheWebhookSigningKey(envId: number, key: string, updatedAt: Date): string {
+        const existing = webhookSigningKeyCache.get(envId);
+        const committedAt = updatedAt.getTime();
+        if (existing && existing.expiresAt > Date.now() && existing.committedAt > committedAt) {
+            return existing.key;
+        }
+
+        webhookSigningKeyCache.set(envId, { key, committedAt, expiresAt: Date.now() + WEBHOOK_SIGNING_KEY_CACHE_TTL_MS });
+        return key;
+    }
+
+    private async readWebhookSigningKey(trx: Knex, envId: number): Promise<{ key: string; updatedAt: Date }> {
+        const row = await this.webhookSigningKeyForEnv(trx, envId).first();
+
+        if (!row) {
+            throw new NangoError('no_webhook_signing_key', { environment_id: envId });
+        }
+
+        const decrypted = getEncryptionManager().decryptAPISecret(row as Parameters<EncryptionManager['decryptAPISecret']>[0]) as DBCustomerKey;
+        return { key: decrypted.secret, updatedAt: row.updated_at };
+    }
+
+    public async getWebhookSigningKeyForEnv(trx: Knex, envId: number): Promise<Result<string>> {
+        const cached = webhookSigningKeyCache.get(envId);
+        if (cached && cached.expiresAt > Date.now()) {
+            return Ok(cached.key);
+        }
+
+        try {
+            const { key, updatedAt } = await this.readWebhookSigningKey(trx, envId);
+            return Ok(this.cacheWebhookSigningKey(envId, key, updatedAt));
+        } catch (err) {
+            return Err(err);
+        }
+    }
+
+    public async getUncachedWebhookSigningKeyForEnv(trx: Knex, envId: number): Promise<Result<string>> {
+        try {
+            const { key } = await this.readWebhookSigningKey(trx, envId);
+            return Ok(key);
+        } catch (err) {
+            return Err(err);
+        }
+    }
+
+    /**
+     * Replaces the environment's webhook signing key with a fresh one and returns it in plain text.
+     * Callers in other processes keep signing with the previous key until their cache entry expires.
+     */
+    public async rotateWebhookSigningKey(trx: Knex, envId: number): Promise<Result<string>> {
+        try {
+            const plainText = uuid.v4();
+
+            const hashed = await this.hashSecret(plainText);
+            if (hashed.isErr()) {
+                throw hashed.error;
+            }
+
+            const encrypted = getEncryptionManager().encryptAPISecret({ secret: plainText, iv: '', tag: '' } as Parameters<
+                EncryptionManager['encryptAPISecret']
+            >[0]);
+
+            const committedAt = await trx.transaction(async (innerTrx) => {
+                const existing = await this.webhookSigningKeyForEnv(innerTrx, envId).forUpdate(CUSTOMER_KEYS_TABLE);
+                const current = existing[0];
+                if (!current) {
+                    throw new CustomerKeyError('no_webhook_signing_key', { environmentId: envId });
+                }
+                if (existing.length > 1) {
+                    throw new CustomerKeyError('multiple_webhook_signing_keys', { environmentId: envId });
+                }
+
+                const updated = await innerTrx<DBCustomerKey>(CUSTOMER_KEYS_TABLE)
+                    .where({ id: current.id })
+                    .update({
+                        secret: encrypted.secret,
+                        iv: encrypted.iv,
+                        tag: encrypted.tag,
+                        hashed: hashed.value,
+                        updated_at: innerTrx.raw('clock_timestamp()') as unknown as Date
+                    })
+                    .returning('updated_at');
+
+                const row = updated[0];
+                if (updated.length !== 1 || !row) {
+                    throw new CustomerKeyError('no_webhook_signing_key', { environmentId: envId });
+                }
+                return row.updated_at;
+            });
+
+            this.cacheWebhookSigningKey(envId, plainText, committedAt);
+            return Ok(plainText);
+        } catch (err) {
+            return Err(err);
+        }
+    }
+
+    public async renameApiKey(trx: Knex, keyId: number, displayName: string, envId: number, accountId: number): Promise<Result<void>> {
+        try {
+            await trx.transaction(async (innerTrx) => {
+                await this.acquireNameLock(innerTrx, accountId, 'api');
+
+                // Check uniqueness: no other API key in the same environment should have this name
+                const existing = await innerTrx<DBCustomerKey>(CUSTOMER_KEYS_TABLE)
+                    .select(`${CUSTOMER_KEYS_TABLE}.id`)
+                    .join(CUSTOMER_KEYS_RELATIONS_TABLE, `${CUSTOMER_KEYS_RELATIONS_TABLE}.customer_key_id`, `${CUSTOMER_KEYS_TABLE}.id`)
+                    .where(`${CUSTOMER_KEYS_TABLE}.key_type`, 'api')
+                    .where(`${CUSTOMER_KEYS_TABLE}.display_name`, displayName)
+                    .where(`${CUSTOMER_KEYS_RELATIONS_TABLE}.entity_type`, 'environment')
+                    .where(`${CUSTOMER_KEYS_RELATIONS_TABLE}.entity_id`, envId)
+                    .whereNull(`${CUSTOMER_KEYS_TABLE}.deleted_at`)
+                    .whereNot(`${CUSTOMER_KEYS_TABLE}.id`, keyId)
+                    .first();
+
+                if (existing) {
+                    throw new CustomerKeyError('duplicate_api_key', { display_name: displayName });
+                }
+
+                const updated = await innerTrx<DBCustomerKey>(CUSTOMER_KEYS_TABLE)
+                    .where(`${CUSTOMER_KEYS_TABLE}.id`, keyId)
+                    .where(`${CUSTOMER_KEYS_TABLE}.key_type`, 'api')
+                    .whereNull(`${CUSTOMER_KEYS_TABLE}.deleted_at`)
+                    .whereExists(function () {
+                        void this.select(innerTrx.raw('1'))
+                            .from(CUSTOMER_KEYS_RELATIONS_TABLE)
+                            .whereRaw(`${CUSTOMER_KEYS_RELATIONS_TABLE}.customer_key_id = ${CUSTOMER_KEYS_TABLE}.id`)
+                            .whereRaw(`${CUSTOMER_KEYS_RELATIONS_TABLE}.entity_type = ?`, ['environment'])
+                            .whereRaw(`${CUSTOMER_KEYS_RELATIONS_TABLE}.entity_id = ?`, [envId]);
+                    })
+                    .update({ display_name: displayName, updated_at: innerTrx.fn.now() as unknown as Date });
+                if (updated === 0) {
+                    throw new CustomerKeyError('no_such_api_secret', { id: keyId });
+                }
+            });
+            return Ok();
+        } catch (err) {
+            return Err(err);
+        }
+    }
+
+    public async updateApiKeyScopes(trx: Knex, keyId: number, scopes: CustomerKeyScope[], envId: number): Promise<Result<void>> {
+        try {
+            const updated = await trx<DBCustomerKey>(CUSTOMER_KEYS_TABLE)
+                .where(`${CUSTOMER_KEYS_TABLE}.id`, keyId)
+                .where(`${CUSTOMER_KEYS_TABLE}.key_type`, 'api')
+                .whereNull(`${CUSTOMER_KEYS_TABLE}.deleted_at`)
+                .whereExists(function () {
+                    void this.select(trx.raw('1'))
+                        .from(CUSTOMER_KEYS_RELATIONS_TABLE)
+                        .whereRaw(`${CUSTOMER_KEYS_RELATIONS_TABLE}.customer_key_id = ${CUSTOMER_KEYS_TABLE}.id`)
+                        .whereRaw(`${CUSTOMER_KEYS_RELATIONS_TABLE}.entity_type = ?`, ['environment'])
+                        .whereRaw(`${CUSTOMER_KEYS_RELATIONS_TABLE}.entity_id = ?`, [envId]);
+                })
+                .update({ scopes, updated_at: trx.fn.now() as unknown as Date });
+            if (updated === 0) {
+                return Err(new CustomerKeyError('no_such_api_secret', { id: keyId }));
+            }
+            return Ok();
+        } catch (err) {
+            return Err(err);
+        }
+    }
+
+    public async deleteCustomerKey(trx: Knex, keyId: number, envId: number): Promise<Result<void>> {
+        try {
+            const updated = await trx<DBCustomerKey>(CUSTOMER_KEYS_TABLE)
+                .where(`${CUSTOMER_KEYS_TABLE}.id`, keyId)
+                .where(`${CUSTOMER_KEYS_TABLE}.key_type`, 'api')
+                .whereNull(`${CUSTOMER_KEYS_TABLE}.deleted_at`)
+                .whereExists(function () {
+                    void this.select(trx.raw('1'))
+                        .from(CUSTOMER_KEYS_RELATIONS_TABLE)
+                        .whereRaw(`${CUSTOMER_KEYS_RELATIONS_TABLE}.customer_key_id = ${CUSTOMER_KEYS_TABLE}.id`)
+                        .whereRaw(`${CUSTOMER_KEYS_RELATIONS_TABLE}.entity_type = ?`, ['environment'])
+                        .whereRaw(`${CUSTOMER_KEYS_RELATIONS_TABLE}.entity_id = ?`, [envId]);
+                })
+                .update({
+                    deleted_at: trx.fn.now() as unknown as Date
+                });
+            if (updated === 0) {
+                return Err(new CustomerKeyError('no_such_api_secret', { id: keyId }));
+            }
+            return Ok();
+        } catch (err) {
+            return Err(err);
+        }
+    }
+
+    public async deleteAccountApiKey(trx: Knex, keyId: number, accountId: number): Promise<Result<void>> {
+        try {
+            const updated = await this.customerKeysQuery(trx, { type: 'account', accountId, keyId }).update({ deleted_at: trx.fn.now() as unknown as Date });
+            if (updated === 0) {
+                return Err(new CustomerKeyError('no_such_api_secret', { id: keyId }));
+            }
+            return Ok();
+        } catch (err) {
+            return Err(err);
+        }
+    }
+
+    private async hashSecret(plainText: string): Promise<Result<string>> {
+        try {
+            if (!getEncryptionManager().shouldEncrypt()) {
+                return Ok(plainText);
+            }
+            const key = getEncryptionManager().getKey();
+            const hash = (await pbkdf2(plainText, key, PBKDF2_ITERATIONS, 32, 'sha256')).toString('base64');
+            return Ok(hash);
+        } catch (err) {
+            return Err(err);
+        }
+    }
+}
+
+export default new CustomerKeyService();

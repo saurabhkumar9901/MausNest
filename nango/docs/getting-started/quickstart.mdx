@@ -1,0 +1,186 @@
+---
+title: 'Quickstart'
+sidebarTitle: '🚀 Quickstart'
+description: 'Give your AI agent access to Gmail, Slack, Notion, and 1,000+ other APIs'
+---
+
+This quickstart adds Nango [agent sessions](/guides/agent-sessions) to your own agent. Your agent gets one MCP server with tools for every API you enable, and asks your users to connect their accounts when it needs them.
+
+<Tip>
+  To try agent sessions without code first, use the **Playground** tab in the [Nango dashboard](https://app.nango.dev/dev/playground/agent).
+</Tip>
+
+<Steps>
+  <Step id="get-api-key" title="Get an API key">
+    [Sign up](https://app.nango.dev/signup) for Nango and copy the [default Environment API key](https://app.nango.dev/dev/environment-settings#api-keys) for your agent. Your backend uses it to call the Nango API.
+
+    <Accordion title="For agents">
+      If the user gave you an Environment API key, for example in the prompt, use it.
+
+      Otherwise, ask the user to sign up at `https://app.nango.dev/signup` and copy the default key from `https://app.nango.dev/dev/environment-settings#api-keys`. It has full permissions.
+
+      Store it as `NANGO_API_KEY` in the backend's local env file, and make sure that file is ignored by Git. Never send the key to a browser or client.
+
+      All requests below go to `https://api.nango.dev` with `Authorization: Bearer <NANGO-API-KEY>`.
+    </Accordion>
+  </Step>
+
+  <Step id="enable-integrations" title="Enable the APIs your agent needs">
+    Pick the APIs your agent can use, for example Gmail, Google Calendar, Slack, or Notion. Nango-managed OAuth apps let you test right away, without registering an app with each provider.
+
+    <Accordion title="For agents">
+      Ask the user which APIs their agent needs. Suggest `google-mail` (Gmail), `google-calendar`, `slack`, and `notion` if they are unsure.
+
+      Look up each provider. `search` matches slugs only, so Gmail is found with `google`, not `gmail`:
+
+      ```bash
+      curl 'https://api.nango.dev/providers?search=google' \
+        --header 'Authorization: Bearer <NANGO-API-KEY>'
+      ```
+
+      Each result has a `name` (the provider slug) and an `auth_mode`, which decides how to create the integration below.
+
+      List the integrations that already exist, and reuse them:
+
+      ```bash
+      curl https://api.nango.dev/integrations \
+        --header 'Authorization: Bearer <NANGO-API-KEY>'
+      ```
+
+      Create each missing integration, with the provider slug as the integration ID.
+
+      **`auth_mode` is `OAUTH2`, `OAUTH1`, or `APP`:** use a Nango-managed OAuth app, so the user doesn't need to register one with the provider:
+
+      ```bash
+      curl --request POST \
+        --url https://api.nango.dev/integrations \
+        --header 'Authorization: Bearer <NANGO-API-KEY>' \
+        --header 'Content-Type: application/json' \
+        --data '{
+          "provider": "google-mail",
+          "unique_key": "google-mail",
+          "credentials": { "type": "NANGO_MANAGED" }
+        }'
+      ```
+
+      If it fails because there is no Nango-managed app for this provider, tell the user. They need to [register their own OAuth app](/guides/auth/auth-guide).
+
+      **Any other `auth_mode`**, such as `API_KEY` or `BASIC`: create it with [`POST /integrations`](/reference/backend/http-api/integration/create). No developer app is needed, and users enter their own credentials when they connect:
+
+      ```bash
+      curl --request POST \
+        --url https://api.nango.dev/integrations \
+        --header 'Authorization: Bearer <NANGO-API-KEY>' \
+        --header 'Content-Type: application/json' \
+        --data '{
+          "provider": "firecrawl",
+          "unique_key": "firecrawl"
+        }'
+      ```
+
+      Check the integration has tools. Nango catalog actions are available out of the box, with nothing to deploy:
+
+      ```bash
+      curl 'https://api.nango.dev/integrations/google-mail/functions?type=action' \
+        --header 'Authorization: Bearer <NANGO-API-KEY>'
+      ```
+    </Accordion>
+  </Step>
+
+  <Step id="create-agent-session" title="Create an agent session in your backend">
+    Before each agent run, your backend creates a session for the user the agent acts for. It covers every API you enabled.
+
+    <Accordion title="For agents">
+      Before each agent run, create an agent session server-side:
+
+      ```bash
+      curl --request POST \
+        --url https://api.nango.dev/sessions \
+        --header 'Authorization: Bearer <NANGO-API-KEY>' \
+        --header 'Content-Type: application/json' \
+        --data '{
+          "tenant": {
+            "connections": {
+              "any": [{ "tags": { "end_user_id": "<YOUR-USER-ID>" } }]
+            }
+          },
+          "toolset": "*",
+          "meta_tools": {
+            "nango_create_connection": {
+              "enabled": true,
+              "tags": { "end_user_id": "<YOUR-USER-ID>" }
+            }
+          }
+        }'
+      ```
+
+      Set `<YOUR-USER-ID>` to the stable ID of the user the agent acts for, the same value in both places. Without user accounts, use a fixed ID like `local-dev-user`.
+
+      The session covers every integration. When the user hasn't connected one yet, the agent gets a connect link to hand them. See [creating a session](/guides/agent-sessions#creating-a-session) for all options.
+
+      The response's `data` contains an `mcp_url` and a `session_token`.
+    </Accordion>
+  </Step>
+
+  <Step id="connect-agent" title="Connect the session to your agent">
+    Pass the session's MCP server to your agent. It works with any agent framework that supports remote MCP servers.
+
+    <Accordion title="For agents">
+      Pass the `mcp_url` to the agent as a remote MCP server, with the `session_token` as bearer auth. For example, with the Vercel AI SDK:
+
+      ```typescript
+      import { createMCPClient } from "@ai-sdk/mcp";
+
+      // `session` is the `data` object returned by POST /sessions
+      const mcpClient = await createMCPClient({
+        transport: {
+          type: "http",
+          url: session.mcp_url,
+          headers: { Authorization: `Bearer ${session.session_token}` }
+        }
+      });
+
+      const tools = await mcpClient.tools();
+      // Pass `tools` to generateText() or streamText() with the agent's other tools
+      ```
+
+      Use the MCP client of the framework the project already uses: see [OpenAI, Anthropic, LangChain, and Mastra](/guides/agent-sessions#pass-mcp) examples. Keep the agent's existing tools.
+
+      Make sure links in the agent's replies render as clickable links, so the user can open connect links from the chat.
+    </Accordion>
+  </Step>
+
+  <Step id="test-agent" title="Test it">
+    Ask your agent something like "Summarize the last 5 emails in my inbox". The first time, it replies with a link to connect your account. Authorize, ask again, and the agent runs the right tool.
+
+    See what was created in the **Integrations**, **Connections**, and **Logs** tabs of the [Nango dashboard](https://app.nango.dev/dev/integrations).
+
+    <Accordion title="For agents">
+      Ask the user to run the app and ask the agent something that needs an enabled API, for example:
+
+      > Summarize the last 5 emails in my inbox.
+
+      The first time, the agent replies with a connect link. The user opens it, authorizes, and asks again. The agent then finds and runs the right tool.
+
+      Then point the user to the **Integrations**, **Connections**, and **Logs** tabs in the [Nango dashboard](https://app.nango.dev/dev/integrations). **Logs** shows every tool call, provider request, and response.
+
+      Finally, suggest the user connect the [Management MCP server with OAuth](/getting-started/coding-agent-setup#oauth-recommended). It's the most efficient way for their coding agent to manage integrations, connections, and logs, and to search the Nango docs moving forward.
+    </Accordion>
+  </Step>
+</Steps>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Configure agent sessions" icon="robot" href="/guides/agent-sessions">
+    Restrict tools, pin connections, and scope access per user or organization.
+  </Card>
+  <Card title="Build custom tools" icon="wand-magic-sparkles" href="/guides/functions/functions-guide">
+    Write action functions for tools the catalog doesn't have.
+  </Card>
+  <Card title="Sync data" icon="arrows-rotate" href="/guides/functions/syncs/sync-functions">
+    Keep external API data fresh in your app with sync functions.
+  </Card>
+</CardGroup>
+
+<Tip>**Questions, problems, feedback?** Please reach out in the [Slack community](https://nango.dev/slack).</Tip>

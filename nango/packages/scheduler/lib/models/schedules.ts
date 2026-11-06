@@ -1,0 +1,409 @@
+import { uuidv7 } from 'uuidv7';
+
+import { Err, Ok, stringifyError } from '@nangohq/utils';
+
+import { isPgLockNotAvailableError, ScheduleLockedError } from '../errors.js';
+
+import type { Schedule, ScheduleProps, ScheduleState, TaskState } from '../types.js';
+import type { Result } from '@nangohq/utils';
+import type knex from 'knex';
+import type { JsonObject } from 'type-fest';
+
+export const SCHEDULES_TABLE = 'schedules';
+
+interface ScheduleStateTransition {
+    from: ScheduleState;
+    to: ScheduleState;
+}
+
+export const validScheduleStateTransitions = [
+    { from: 'STARTED', to: 'PAUSED' },
+    { from: 'STARTED', to: 'DELETED' },
+    { from: 'PAUSED', to: 'STARTED' },
+    { from: 'PAUSED', to: 'DELETED' }
+] as const;
+export type ValidScheduleStateTransitions = (typeof validScheduleStateTransitions)[number];
+
+const ScheduleStateTransition = {
+    validate({ from, to }: { from: ScheduleState; to: ScheduleState }): Result<ValidScheduleStateTransitions> {
+        const transition = validScheduleStateTransitions.find((t) => t.from === from && t.to === to);
+        if (transition) {
+            return Ok(transition);
+        } else {
+            return Err(new Error(`Invalid state transition from ${from} to ${to}`));
+        }
+    }
+};
+
+export interface DbSchedule {
+    readonly id: string;
+    readonly name: string;
+    state: ScheduleState;
+    readonly starts_at: Date;
+    frequency: string;
+    payload: JsonObject;
+    readonly group_key: string;
+    readonly retry_max: number;
+    readonly created_to_started_timeout_secs: number;
+    readonly started_to_completed_timeout_secs: number;
+    readonly heartbeat_timeout_secs: number;
+    readonly created_at: Date;
+    updated_at: Date;
+    deleted_at: Date | null;
+    last_scheduled_task_id: string | null;
+    last_scheduled_task_state: TaskState | null;
+    next_execution_at: Date;
+}
+
+// knex uses https://github.com/bendrucker/postgres-interval
+function postgresIntervalInMs(i: {
+    years?: number;
+    months?: number;
+    days?: number;
+    hours?: number;
+    minutes?: number;
+    seconds?: number;
+    milliseconds?: number;
+}): number {
+    return (
+        (i.years ?? 0) * 31536000000 +
+        (i.months ?? 0) * 2592000000 +
+        (i.days ?? 0) * 86400000 +
+        (i.hours ?? 0) * 3600000 +
+        (i.minutes ?? 0) * 60000 +
+        (i.seconds ?? 0) * 1000 +
+        (i.milliseconds ?? 0)
+    );
+}
+
+export const DbSchedule = {
+    to: (schedule: Schedule): DbSchedule => ({
+        id: schedule.id.toString(),
+        name: schedule.name,
+        state: schedule.state,
+        starts_at: schedule.startsAt,
+        frequency: `${schedule.frequencyMs} milliseconds`,
+        payload: schedule.payload,
+        group_key: schedule.groupKey,
+        retry_max: schedule.retryMax,
+        created_to_started_timeout_secs: schedule.createdToStartedTimeoutSecs,
+        started_to_completed_timeout_secs: schedule.startedToCompletedTimeoutSecs,
+        heartbeat_timeout_secs: schedule.heartbeatTimeoutSecs,
+        created_at: schedule.createdAt,
+        updated_at: schedule.updatedAt,
+        deleted_at: schedule.deletedAt,
+        last_scheduled_task_id: schedule.lastScheduledTaskId,
+        last_scheduled_task_state: schedule.lastScheduledTaskState,
+        next_execution_at: schedule.nextExecutionAt
+    }),
+    from: (dbSchedule: DbSchedule): Schedule => ({
+        id: dbSchedule.id,
+        name: dbSchedule.name,
+        state: dbSchedule.state,
+        startsAt: dbSchedule.starts_at,
+        frequencyMs: postgresIntervalInMs(dbSchedule.frequency as any),
+        payload: dbSchedule.payload,
+        groupKey: dbSchedule.group_key,
+        retryMax: dbSchedule.retry_max,
+        createdToStartedTimeoutSecs: dbSchedule.created_to_started_timeout_secs,
+        startedToCompletedTimeoutSecs: dbSchedule.started_to_completed_timeout_secs,
+        heartbeatTimeoutSecs: dbSchedule.heartbeat_timeout_secs,
+        createdAt: dbSchedule.created_at,
+        updatedAt: dbSchedule.updated_at,
+        deletedAt: dbSchedule.deleted_at,
+        lastScheduledTaskId: dbSchedule.last_scheduled_task_id,
+        lastScheduledTaskState: dbSchedule.last_scheduled_task_state,
+        nextExecutionAt: dbSchedule.next_execution_at
+    })
+};
+
+/** Return a live schedule unchanged, or create/resurrect it when missing/deleted. */
+export async function create(db: knex.Knex, props: ScheduleProps): Promise<Result<Schedule>> {
+    return (await createBatch(db, [props])).map((rows) => rows[0]!);
+}
+
+/** Atomically create missing schedules, resurrect deleted schedules, and leave live schedules untouched. */
+export async function createBatch(db: knex.Knex, props: ScheduleProps[]): Promise<Result<Schedule[]>> {
+    if (props.length === 0) {
+        return Ok([]);
+    }
+    const now = new Date();
+    const values = props.map((entry) =>
+        DbSchedule.to({
+            ...entry,
+            id: uuidv7(),
+            startsAt: now,
+            createdAt: now,
+            updatedAt: now,
+            deletedAt: null,
+            lastScheduledTaskId: null,
+            lastScheduledTaskState: null,
+            nextExecutionAt: now
+        })
+    );
+    try {
+        const rows = await db.transaction(async (trx) => {
+            await trx
+                .from<DbSchedule>(SCHEDULES_TABLE)
+                .insert(values)
+                .onConflict('name')
+                .merge([
+                    'state',
+                    'starts_at',
+                    'frequency',
+                    'payload',
+                    'group_key',
+                    'retry_max',
+                    'created_to_started_timeout_secs',
+                    'started_to_completed_timeout_secs',
+                    'heartbeat_timeout_secs',
+                    'updated_at',
+                    'deleted_at',
+                    'last_scheduled_task_id',
+                    'last_scheduled_task_state',
+                    'next_execution_at'
+                ])
+                .where(`${SCHEDULES_TABLE}.state`, 'DELETED');
+            // Live duplicates are skipped by the insert, so RETURNING would omit their IDs.
+            // Therefore all requested schedules are fetched afterward to include both new and existing rows.
+            const existing = await trx.from<DbSchedule>(SCHEDULES_TABLE).whereIn(
+                'name',
+                props.map((entry) => entry.name)
+            );
+            return existing.map(DbSchedule.from);
+        });
+        return Ok(rows);
+    } catch (err) {
+        return Err(new Error(`Error creating schedules: ${stringifyError(err)}`));
+    }
+}
+
+export async function get(db: knex.Knex, scheduleId: string): Promise<Result<Schedule>> {
+    try {
+        const schedule = await db.from<DbSchedule>(SCHEDULES_TABLE).where('id', scheduleId).first();
+        if (!schedule) {
+            return Err(new Error(`Error: no schedule '${scheduleId}' found`));
+        }
+        return Ok(DbSchedule.from(schedule));
+    } catch (err) {
+        return Err(new Error(`Error getting schedule '${scheduleId}': ${stringifyError(err)}`));
+    }
+}
+
+export async function transitionState(db: knex.Knex, scheduleId: string, to: ScheduleState): Promise<Result<Schedule>> {
+    try {
+        const getSchedule = await get(db, scheduleId);
+        if (getSchedule.isErr()) {
+            return Err(new Error(`Error: no schedule '${scheduleId}' found`));
+        }
+        const transition = ScheduleStateTransition.validate({ from: getSchedule.value.state, to });
+        if (transition.isErr()) {
+            return Err(transition.error);
+        }
+        const now = new Date();
+        const values = {
+            state: to,
+            updated_at: now,
+            ...(to === 'DELETED' ? { deleted_at: now } : {})
+        };
+        const updated = await db.from<DbSchedule>(SCHEDULES_TABLE).where('id', scheduleId).update(values).returning('*');
+        if (!updated?.[0]) {
+            return Err(new Error(`Error: no schedule '${scheduleId}' updated`));
+        }
+        return Ok(DbSchedule.from(updated[0]));
+    } catch (err) {
+        return Err(new Error(`Error transitioning schedule '${scheduleId}': ${stringifyError(err)}`));
+    }
+}
+
+type ScheduleUpdate = Partial<Pick<ScheduleProps, 'frequencyMs' | 'payload'>> & { id: string };
+
+export async function update(db: knex.Knex, entries: ScheduleUpdate[]): Promise<Result<Schedule[]>> {
+    if (entries.length === 0) {
+        return Ok([]);
+    }
+    if (new Set(entries.map((entry) => entry.id)).size !== entries.length) {
+        return Err(new Error('Duplicate schedule IDs in update'));
+    }
+
+    try {
+        const updated = await db.transaction(async (trx) => {
+            const values = entries.map(() => '(?::uuid, ?::double precision, ?::json)').join(', ');
+            const bindings = entries.flatMap((entry) => [entry.id, entry.frequencyMs ?? null, entry.payload ?? null]);
+            const { rows } = await trx.raw<{ rows: DbSchedule[] }>(
+                `UPDATE ${SCHEDULES_TABLE} AS schedule
+                 SET frequency = CASE
+                         WHEN input.frequencyMs IS NOT NULL
+                         THEN input.frequencyMs * INTERVAL '1 millisecond'
+                         ELSE schedule.frequency
+                     END,
+                     payload = COALESCE(input.payload, schedule.payload),
+                     next_execution_at = CASE
+                         WHEN input.frequencyMs IS NOT NULL
+                         THEN schedule.starts_at + (
+                             CEILING(
+                                 EXTRACT(EPOCH FROM (NOW() - schedule.starts_at))
+                                 / (input.frequencyMs / 1000.0)
+                             ) * INTERVAL '1 millisecond' * input.frequencyMs
+                         )
+                         ELSE schedule.next_execution_at
+                     END,
+                     updated_at = NOW()
+                 FROM (VALUES ${values}) AS input(id, frequencyMs, payload)
+                 WHERE schedule.id = input.id
+                 RETURNING schedule.*`,
+                bindings
+            );
+
+            if (rows.length !== entries.length) {
+                throw new Error('Some schedules were not found during update');
+            }
+            return rows.map(DbSchedule.from);
+        });
+        return Ok(updated);
+    } catch (err) {
+        return Err(new Error(`Error updating schedules: ${stringifyError(err)}`));
+    }
+}
+
+export async function setLastScheduledTask(db: knex.Knex, updates: { id: string; taskId: string; taskState: TaskState }[]): Promise<Result<Schedule[]>> {
+    try {
+        if (updates.length === 0) {
+            return Ok([]);
+        }
+
+        const BATCH_SIZE = 1000;
+        const results: DbSchedule[] = [];
+
+        await db.transaction(async (trx) => {
+            for (let i = 0; i < updates.length; i += BATCH_SIZE) {
+                const batch = updates.slice(i, i + BATCH_SIZE);
+                const bindings = batch.flatMap((u) => [u.id, u.taskId, u.taskState]);
+                const values = batch.map(() => '(?::uuid, ?::uuid, ?::task_states)').join(', ');
+
+                const updated = await trx.raw(
+                    `UPDATE ${SCHEDULES_TABLE}
+                    SET
+                        last_scheduled_task_id = v.task_id,
+                        last_scheduled_task_state = v.task_state,
+                        updated_at = NOW()
+                    FROM (VALUES ${values}) AS v(id, task_id, task_state)
+                    WHERE ${SCHEDULES_TABLE}.id = v.id::uuid
+                    RETURNING ${SCHEDULES_TABLE}.*`,
+                    bindings
+                );
+
+                const batchResult = updated.rows || updated;
+                results.push(...batchResult);
+            }
+        });
+
+        if (results.length === 0) {
+            return Err(new Error(`Error: no schedules updated for tasks ${updates.map((u) => u.taskId).join(', ')}`));
+        }
+
+        return Ok(results.map(DbSchedule.from));
+    } catch (err) {
+        return Err(new Error(`Error setting last scheduled task ${JSON.stringify(updates)}: ${stringifyError(err)}`));
+    }
+}
+
+export async function scheduleNextExecution(
+    db: knex.Knex,
+    { taskIds, taskState, nextExecutionInMs }: { taskIds: string[]; taskState: TaskState; nextExecutionInMs?: number | undefined }
+): Promise<Result<Schedule[]>> {
+    try {
+        if (taskIds.length <= 0) {
+            return Ok([]);
+        }
+        if (nextExecutionInMs !== undefined && nextExecutionInMs < 0) {
+            return Err(new Error(`Invalid nextExecutionInMs: ${nextExecutionInMs}. Must be a positive integer.`));
+        }
+        const updated = await db(SCHEDULES_TABLE)
+            .update({
+                updated_at: db.fn.now(),
+                last_scheduled_task_state: taskState,
+                next_execution_at:
+                    nextExecutionInMs !== undefined
+                        ? db.raw(`NOW() + ? * INTERVAL '1 millisecond'`, [nextExecutionInMs])
+                        : db.raw('starts_at + CEILING(EXTRACT(EPOCH FROM (NOW() - starts_at)) / EXTRACT(EPOCH FROM frequency)) * frequency')
+            })
+            .whereIn('last_scheduled_task_id', taskIds)
+            .returning('*');
+        return Ok(updated.map(DbSchedule.from));
+    } catch (err) {
+        return Err(new Error(`Error scheduling next execution for tasks ${taskIds.join(', ')}: ${stringifyError(err)}`));
+    }
+}
+
+export async function remove(db: knex.Knex, id: string): Promise<Result<Schedule>> {
+    try {
+        const now = new Date();
+        const deleted = await db
+            .from<DbSchedule>(SCHEDULES_TABLE)
+            .where('id', id)
+            .update({ state: 'DELETED', deleted_at: now, updated_at: now })
+            .returning('*');
+        if (!deleted?.[0]) {
+            return Err(new Error(`Error: no schedule '${id}' deleted`));
+        }
+        return Ok(DbSchedule.from(deleted[0]));
+    } catch (err) {
+        return Err(new Error(`Error deleting schedule '${id}': ${stringifyError(err)}`));
+    }
+}
+
+export async function search(
+    db: knex.Knex,
+    params: { id?: string; names?: string[]; state?: ScheduleState; limit: number; forUpdate?: boolean; noWait?: boolean }
+): Promise<Result<Schedule[]>> {
+    try {
+        const query = db.from<DbSchedule>(SCHEDULES_TABLE).limit(params.limit);
+        if (params.id) {
+            query.where('id', params.id);
+        }
+        if (params.names) {
+            query.whereIn('name', params.names);
+        }
+        if (params.state) {
+            query.where('state', params.state);
+        }
+        if (params.forUpdate) {
+            query.forUpdate();
+            if (params.noWait) {
+                query.noWait();
+            }
+        }
+        const schedules = await query;
+        return Ok(schedules.map(DbSchedule.from));
+    } catch (err) {
+        if (isPgLockNotAvailableError(err)) {
+            return Err(new ScheduleLockedError());
+        }
+        return Err(new Error(`Error searching schedules: ${stringifyError(err)}`));
+    }
+}
+
+export async function hardDeleteOlderThanNDays(db: knex.Knex, days: number): Promise<Result<DbSchedule[]>> {
+    try {
+        // NOTE: only deleting one schedule at a time to avoid massive cascading deletes of tasks
+        const deleted = await db
+            .from<DbSchedule>(SCHEDULES_TABLE)
+            .where(
+                'id',
+                '=',
+                db.raw(`ANY(ARRAY(
+                    SELECT "id"
+                    FROM ${SCHEDULES_TABLE}
+                    WHERE "deleted_at" < NOW() - INTERVAL '${days} days'
+                    ORDER BY "id" ASC
+                    LIMIT 1
+                  ))`)
+            )
+            .del()
+            .returning('*');
+        return Ok(deleted);
+    } catch (err) {
+        return Err(new Error(`Error hard deleting schedules older than ${days} days: ${stringifyError(err)}`));
+    }
+}

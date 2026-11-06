@@ -1,0 +1,162 @@
+import './tracer.js';
+
+import { destroy as destroyFeatureFlags, initialize as initializeFeatureFlags } from '@nangohq/feature-flags';
+import { destroyHostedTelemetryDb, hostedTelemetry, hostedTelemetryDb, initHostedTelemetry } from '@nangohq/hosted-telemetry';
+import { DatabaseClient, defaultDatabaseClientOptions, Scheduler } from '@nangohq/scheduler';
+import { metrics, once, report, stringifyError } from '@nangohq/utils';
+
+import { BackpressureMonitor } from './backpressure-monitor.js';
+import { ConcurrencySampler } from './concurrency-sampler.js';
+import { envs } from './env.js';
+import { TaskEventsHandler } from './events.js';
+import { createImmediateRateLimiter } from './rateLimiter.js';
+import { buildSchedulerConfig, handleSchedulerEvent } from './scheduler-config.js';
+import { getServer } from './server.js';
+import { logger } from './utils.js';
+
+process.on('unhandledRejection', (reason) => {
+    logger.error('Received unhandledRejection...', reason);
+    report(reason);
+    // not closing on purpose
+});
+
+process.on('uncaughtException', (err) => {
+    logger.error('Received uncaughtException...', err);
+    report(err);
+    // not closing on purpose
+});
+
+const databaseSchema = envs.ORCHESTRATOR_DATABASE_SCHEMA;
+const databaseUrl =
+    envs.ORCHESTRATOR_DATABASE_URL ||
+    envs.NANGO_DATABASE_URL ||
+    `postgres://${encodeURIComponent(envs.NANGO_DB_USER)}:${encodeURIComponent(envs.NANGO_DB_PASSWORD)}@${envs.NANGO_DB_HOST}:${envs.NANGO_DB_PORT}/${envs.NANGO_DB_NAME}`;
+
+try {
+    await initializeFeatureFlags();
+
+    const telemetryDb = hostedTelemetryDb();
+    if (telemetryDb) {
+        initHostedTelemetry({ knex: telemetryDb });
+    }
+
+    const immediateRateLimiter = await createImmediateRateLimiter(envs.ORCHESTRATOR_THROTTLED_IMMEDIATE_PER_MIN);
+
+    const dbClient = new DatabaseClient({
+        ...defaultDatabaseClientOptions,
+        url: databaseUrl,
+        schema: databaseSchema,
+        poolMax: envs.ORCHESTRATOR_DB_POOL_MAX,
+        ssl: envs.ORCHESTRATOR_DB_SSL ? { rejectUnauthorized: false } : false,
+        applicationName: envs.NANGO_DB_APPLICATION_NAME
+    });
+    await dbClient.migrate();
+
+    const eventsHandler = new TaskEventsHandler(dbClient.db);
+    await eventsHandler.connect();
+
+    const scheduler = new Scheduler({
+        db: dbClient.db,
+        on: eventsHandler.onCallbacks,
+        onError: async (err) => {
+            report(err);
+            logger.error(`Scheduler error: ${stringifyError(err)}`);
+            try {
+                await immediateRateLimiter.destroy();
+                await destroyFeatureFlags();
+                await dbClient.destroy();
+                await hostedTelemetry.shutdown();
+                await destroyHostedTelemetryDb();
+            } catch (cleanupErr) {
+                logger.error(`Failed to clean up after scheduler error: ${stringifyError(cleanupErr)}`);
+            } finally {
+                logger.close();
+                process.exit(1); // scheduler error is critical, we exit the process
+            }
+        },
+        config: buildSchedulerConfig(envs),
+        onEvent: handleSchedulerEvent,
+        logger
+    });
+    scheduler.start();
+
+    const backpressureMonitor = new BackpressureMonitor({
+        scheduler,
+        tickIntervalMs: envs.ORCHESTRATOR_BACKPRESSURE_MONITORING_TICK_INTERVAL_MS,
+        topN: envs.ORCHESTRATOR_BACKPRESSURE_MONITORING_TOP_N,
+        onError: (err) => {
+            report(err);
+            logger.error(`BackpressureMonitor error: ${stringifyError(err)}`);
+        }
+    });
+    backpressureMonitor.start();
+
+    const concurrencySampler =
+        envs.ORCHESTRATOR_CONCURRENCY_SAMPLING_TICK_INTERVAL_MS > 0
+            ? new ConcurrencySampler({
+                  scheduler,
+                  tickIntervalMs: envs.ORCHESTRATOR_CONCURRENCY_SAMPLING_TICK_INTERVAL_MS,
+                  queryTimeoutMs: envs.ORCHESTRATOR_CONCURRENCY_SAMPLING_QUERY_TIMEOUT_MS,
+                  onError: (err) => {
+                      report(err);
+                      logger.error(`ConcurrencySampler error: ${stringifyError(err)}`);
+                  }
+              })
+            : null;
+    concurrencySampler?.start();
+
+    // default max listener is 10
+    // but we need more listeners
+    // each processor fetching from a group_key adds a listener for the long-polling dequeue
+    eventsHandler.setMaxListeners(Infinity);
+
+    const server = getServer(scheduler, eventsHandler, immediateRateLimiter);
+    const port = envs.NANGO_ORCHESTRATOR_PORT;
+    const api = server.listen(port, () => {
+        logger.info(`🚀 Orchestrator API ready at http://localhost:${port}`);
+    });
+    if (envs.NANGO_ORCHESTRATOR_KEEP_ALIVE_TIMEOUT_MS && envs.NANGO_ORCHESTRATOR_KEEP_ALIVE_TIMEOUT_MS > 0) {
+        api.keepAliveTimeout = envs.NANGO_ORCHESTRATOR_KEEP_ALIVE_TIMEOUT_MS;
+        api.headersTimeout = envs.NANGO_ORCHESTRATOR_KEEP_ALIVE_TIMEOUT_MS + 1000;
+    }
+    // --- Close function
+    const close = once(() => {
+        logger.info('Closing...');
+        // eslint-disable-next-line @typescript-eslint/no-misused-promises
+        api.close(async () => {
+            const stoppedDaemons = await Promise.allSettled([backpressureMonitor.stop(), concurrencySampler?.stop()]);
+            for (const res of stoppedDaemons) {
+                if (res.status === 'rejected') {
+                    logger.error(`Failed to stop a daemon: ${stringifyError(res.reason)}`);
+                }
+            }
+            await scheduler.stop();
+            await eventsHandler.disconnect();
+            await immediateRateLimiter.destroy();
+            await destroyFeatureFlags();
+            await dbClient.destroy();
+            await hostedTelemetry.shutdown();
+            await destroyHostedTelemetryDb();
+
+            logger.close();
+
+            console.info('Closed');
+
+            await metrics.flush();
+            process.exit();
+        });
+    });
+
+    process.on('SIGINT', () => {
+        logger.info('Received SIGINT...');
+        close();
+    });
+
+    process.on('SIGTERM', () => {
+        logger.info('Received SIGTERM...');
+        close();
+    });
+} catch (err) {
+    logger.error(`Orchestrator API error: ${stringifyError(err)}`);
+    process.exit(1);
+}

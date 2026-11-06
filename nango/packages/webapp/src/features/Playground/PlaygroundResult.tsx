@@ -1,0 +1,102 @@
+import { Braces, CheckCircle2, ExternalLink, Info, XCircle } from 'lucide-react';
+import { useMemo } from 'react';
+
+import { Alert, AlertActions, AlertDescription } from '@nangohq/design-system';
+
+import { AlertButtonLink } from '@/components/ui/AlertButtonLink';
+import { CodeBlock } from '@/components/ui/CodeBlock';
+import { usePlaygroundStore } from '@/store/playground';
+import { JSON_DISPLAY_LIMIT } from '@/utils/json';
+import { getLogsUrl } from '@/utils/logs';
+
+// TODO: set to true once the records list page is ready
+const showRecordsButton = false;
+
+interface Props {
+    env: string;
+    isSync: boolean;
+}
+
+export const PlaygroundResultData: React.FC = () => {
+    const result = usePlaygroundStore((s) => s.result);
+
+    const resultJson = useMemo(() => {
+        if (!result) return '';
+        try {
+            const json = JSON.stringify(result.data, null, 2);
+            return json.length >= JSON_DISPLAY_LIMIT ? 'Result too large to display' : json;
+        } catch {
+            return String(result.data);
+        }
+    }, [result]);
+
+    if (!result) return null;
+
+    return <CodeBlock language="json" displayLanguage="JSON" icon={<Braces />} code={resultJson} constrainHeight={false} />;
+};
+
+export const PlaygroundResultStatus: React.FC<Props> = ({ env, isSync }) => {
+    const result = usePlaygroundStore((s) => s.result);
+    const playgroundIntegration = usePlaygroundStore((s) => s.integration);
+    const playgroundConnection = usePlaygroundStore((s) => s.connection);
+    const playgroundFunction = usePlaygroundStore((s) => s.function);
+    const playgroundFunctionType = usePlaygroundStore((s) => s.functionType);
+
+    if (!result) return null;
+
+    return (
+        <Alert
+            variant={
+                result.state === 'waiting' || result.state === 'running' || result.state === 'operation_not_found'
+                    ? 'info'
+                    : result.success
+                      ? 'success'
+                      : 'danger'
+            }
+            size="compact"
+        >
+            {result.state === 'waiting' || result.state === 'running' || result.state === 'operation_not_found' ? (
+                <Info />
+            ) : result.success ? (
+                <CheckCircle2 />
+            ) : (
+                <XCircle />
+            )}
+            <AlertDescription>
+                {result.state === 'invalid_input'
+                    ? 'Invalid input (see the result for details)'
+                    : result.state === 'operation_not_found'
+                      ? 'Triggered successfully but could not track the operation'
+                      : result.state === 'metadata_update_failed'
+                        ? 'Failed to update connection metadata'
+                        : result.state === 'waiting' || result.state === 'running'
+                          ? `Running for ${(result.durationMs / 1000).toFixed(1)}s`
+                          : result.success
+                            ? `Ran in ${(result.durationMs / 1000).toFixed(1)}s`
+                            : `Failed after ${(result.durationMs / 1000).toFixed(1)}s`}
+            </AlertDescription>
+            <AlertActions>
+                {isSync && playgroundIntegration && playgroundConnection && showRecordsButton && (
+                    <AlertButtonLink to={`/${env}/connections/${playgroundIntegration}/${encodeURIComponent(playgroundConnection)}`}>Records</AlertButtonLink>
+                )}
+                {playgroundIntegration && playgroundConnection && playgroundFunction && (
+                    <AlertButtonLink
+                        to={getLogsUrl({
+                            env,
+                            ...(result.operationId ? { operationId: result.operationId } : {}),
+                            integrations: playgroundIntegration,
+                            connections: playgroundConnection,
+                            types: playgroundFunctionType === 'tool' ? 'function:invoke' : undefined,
+                            syncs: isSync || playgroundFunctionType === 'tool' ? playgroundFunction : undefined,
+                            live: true
+                        })}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                    >
+                        Logs <ExternalLink />
+                    </AlertButtonLink>
+                )}
+            </AlertActions>
+        </Alert>
+    );
+};

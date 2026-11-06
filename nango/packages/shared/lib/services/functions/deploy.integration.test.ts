@@ -1,0 +1,465 @@
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import db, { multipleMigrations } from '@nangohq/database';
+import { Err, Ok } from '@nangohq/utils';
+
+import { createAccount } from '../../seeders/account.seeder.js';
+import { createConfigSeed } from '../../seeders/config.seeder.js';
+import { createConnectionSeed } from '../../seeders/connection.seeder.js';
+import { createEnvironmentSeed } from '../../seeders/environment.seeder.js';
+import remoteFileService from '../file/remote.service.js';
+import { deployBundle, prepareDeploymentBundle } from './deploy.js';
+import { search, upsert } from './models/functions.js';
+import { CONFIGS_TABLE, INSTANCES_TABLE } from './models/tables.js';
+import { functionVersionHash } from './version.js';
+
+import type { Orchestrator } from '../../clients/orchestrator.js';
+import type { DBFunctionConfigVersion, DBFunctionInstance, FunctionDeploymentArtifact } from '@nangohq/types';
+
+const githubArtifact = {
+    name: 'fetchIssues',
+    integrationId: 'github',
+    description: 'Fetch issues',
+    trigger: { kind: 'none' },
+    requires: { connection: true, outbound: true, invoke: false },
+    capabilities: { usesOutbound: true, usesRecords: false, usesMetadata: false, usesCheckpoints: false, usesInvoke: false },
+    limits: { concurrency: { perConnection: 'max' } },
+    input_schema_ref: null,
+    output_schema_ref: null,
+    model_schema_refs: [],
+    metadata_schema_ref: null,
+    checkpoint_schema_ref: null,
+    json_schema: { type: 'object' },
+    fileBody: { js: 'export default async function run() {}', ts: 'export default async function run(): Promise<void> {}' }
+} satisfies FunctionDeploymentArtifact;
+
+const gitlabArtifact = {
+    ...githubArtifact,
+    name: 'fetchMergeRequests',
+    integrationId: 'gitlab'
+} satisfies FunctionDeploymentArtifact;
+
+function functionVersion(
+    artifact: FunctionDeploymentArtifact
+): Omit<DBFunctionConfigVersion, 'id' | 'function_config_id' | 'created_at' | 'updated_at' | 'deleted_at'> {
+    return {
+        description: artifact.description,
+        tags: {},
+        file_location: `functions/${artifact.integrationId}/${artifact.name}`,
+        version: functionVersionHash(artifact).unwrap(),
+        source: 'repo',
+        trigger: artifact.trigger,
+        requires: artifact.requires,
+        capabilities: artifact.capabilities,
+        limits: artifact.limits,
+        input_schema_ref: artifact.input_schema_ref,
+        output_schema_ref: artifact.output_schema_ref,
+        model_schema_refs: artifact.model_schema_refs,
+        metadata_schema_ref: artifact.metadata_schema_ref,
+        checkpoint_schema_ref: artifact.checkpoint_schema_ref,
+        json_schema: artifact.json_schema
+    };
+}
+
+async function seedEnvironmentWithFunctions(): Promise<number> {
+    const account = await createAccount();
+    const environment = await createEnvironmentSeed(account.id);
+    await createConfigSeed(environment, githubArtifact.integrationId, 'github');
+    await createConfigSeed(environment, gitlabArtifact.integrationId, 'gitlab');
+
+    for (const artifact of [githubArtifact, gitlabArtifact]) {
+        await upsert(db.knex, [
+            {
+                environmentId: environment.id,
+                integrationId: artifact.integrationId,
+                name: artifact.name,
+                version: functionVersion(artifact)
+            }
+        ]);
+    }
+
+    return environment.id;
+}
+
+describe('deployBundle instances', () => {
+    const scheduled: FunctionDeploymentArtifact = { ...githubArtifact, trigger: { kind: 'schedule', frequency: 'every 5 minutes' } };
+
+    beforeAll(async () => {
+        await multipleMigrations();
+    });
+
+    beforeEach(() => {
+        vi.spyOn(remoteFileService, 'upload').mockImplementation(({ destinationPath }) => Promise.resolve(destinationPath));
+    });
+
+    afterEach(() => {
+        vi.restoreAllMocks();
+    });
+
+    async function setup() {
+        const account = await createAccount();
+        const environment = await createEnvironmentSeed(account.id);
+        await createConfigSeed(environment, 'github', 'github');
+        const connection = await createConnectionSeed({ env: environment, provider: 'github' });
+        const orchestrator = {
+            scheduleFunctions: vi.fn<Orchestrator['scheduleFunctions']>().mockResolvedValue(Ok(undefined)),
+            deleteFunctionSchedules: vi.fn<Orchestrator['deleteFunctionSchedules']>().mockResolvedValue(Ok(undefined))
+        };
+        const deploy = async (functions: FunctionDeploymentArtifact[]) => {
+            const reconciliation = (
+                await prepareDeploymentBundle({ functions, environmentId: environment.id, reconciliationScope: { kind: 'environment' } })
+            ).unwrap();
+            return deployBundle({ accountId: account.id, environmentId: environment.id, environmentName: environment.name, reconciliation, orchestrator });
+        };
+        const instances = () =>
+            db.knex
+                .from<DBFunctionInstance>(INSTANCES_TABLE)
+                .whereIn('function_config_id', db.knex.from(CONFIGS_TABLE).select('id').where({ environment_id: environment.id }))
+                .orderBy('id');
+        return { environment, connection, deploy, instances, orchestrator };
+    }
+
+    it('creates base instances only for active connections in the matching integration and environment', async () => {
+        const ctx = await setup();
+        const second = await createConnectionSeed({ env: ctx.environment, provider: 'github' });
+        const deleted = await createConnectionSeed({ env: ctx.environment, provider: 'github' });
+        await db.knex.from('_nango_connections').where({ id: deleted.id }).update({ deleted: true });
+        await createConfigSeed(ctx.environment, 'gitlab', 'gitlab');
+        await createConnectionSeed({ env: ctx.environment, provider: 'gitlab' });
+        const other = await setup();
+
+        (await ctx.deploy([scheduled])).unwrap();
+
+        const rows = await ctx.instances();
+        expect(rows).toHaveLength(2);
+        expect(rows.map((row) => row.nango_connection_id).sort((a, b) => a - b)).toEqual([ctx.connection.id, second.id].sort((a, b) => a - b));
+        for (const row of rows) {
+            expect(row).toMatchObject({
+                name: scheduled.name,
+                variant: 'base',
+                frequency: null,
+                deleted_at: null
+            });
+        }
+        expect(await other.instances()).toEqual([]);
+        const [functionConfig] = (
+            await search(db.knex, { environmentId: ctx.environment.id, filter: { integrationKey: 'github', name: scheduled.name } })
+        ).unwrap();
+        expect(ctx.orchestrator.scheduleFunctions).toHaveBeenCalledWith(
+            rows.map((instance) => ({
+                environmentId: ctx.environment.id,
+                instance,
+                functionUuid: functionConfig!.config.uuid,
+                connection: {
+                    id: instance.nango_connection_id,
+                    connection_id: [ctx.connection, second].find((connection) => connection.id === instance.nango_connection_id)!.connection_id,
+                    provider_config_key: 'github',
+                    environment_id: ctx.environment.id
+                },
+                frequencyFallback: 'every 5 minutes'
+            }))
+        );
+        expect(other.orchestrator.scheduleFunctions).not.toHaveBeenCalled();
+    });
+
+    it('creates instances when a non-scheduled function becomes scheduled', async () => {
+        const ctx = await setup();
+        (await ctx.deploy([githubArtifact])).unwrap();
+        expect(await ctx.instances()).toEqual([]);
+
+        (await ctx.deploy([scheduled])).unwrap();
+        expect(await ctx.instances()).toEqual([expect.objectContaining({ nango_connection_id: ctx.connection.id, variant: 'base', deleted_at: null })]);
+    });
+
+    it('preserves instances and frequency overrides on unchanged and updated scheduled deployments', async () => {
+        const ctx = await setup();
+        (await ctx.deploy([scheduled])).unwrap();
+        await db.knex.from(INSTANCES_TABLE).where({ nango_connection_id: ctx.connection.id }).update({ frequency: 'every 30 minutes' });
+        const before = await ctx.instances();
+
+        (await ctx.deploy([scheduled])).unwrap();
+        expect(await ctx.instances()).toEqual(before);
+        (await ctx.deploy([{ ...scheduled, trigger: { kind: 'schedule', frequency: 'every 10 minutes' } }])).unwrap();
+        expect(await ctx.instances()).toEqual(before);
+        expect(ctx.orchestrator.scheduleFunctions).toHaveBeenCalledTimes(3);
+    });
+
+    it.each(['trigger change', 'config removal'])('soft-deletes instances on %s without affecting another environment', async (reason) => {
+        const ctx = await setup();
+        const other = await setup();
+        (await ctx.deploy([scheduled])).unwrap();
+        (await other.deploy([scheduled])).unwrap();
+        const before = await ctx.instances();
+        const otherBefore = await other.instances();
+
+        (await ctx.deploy(reason === 'trigger change' ? [githubArtifact] : [])).unwrap();
+
+        const after = await ctx.instances();
+        expect(after).toHaveLength(1);
+        expect(after[0]?.id).toBe(before[0]?.id);
+        expect(after[0]?.deleted_at).toBeInstanceOf(Date);
+        expect(await other.instances()).toEqual(otherBefore);
+        expect(ctx.orchestrator.deleteFunctionSchedules).toHaveBeenCalledWith({ environmentId: ctx.environment.id, instanceIds: before.map((row) => row.id) });
+        expect(other.orchestrator.deleteFunctionSchedules).not.toHaveBeenCalled();
+    });
+
+    it('commits instances before scheduling and preserves them when scheduling fails', async () => {
+        const ctx = await setup();
+        const schedulingError = new Error('orchestrator unavailable');
+        let visibleInstances: DBFunctionInstance[] | undefined;
+        ctx.orchestrator.scheduleFunctions.mockImplementationOnce(async () => {
+            // Read on a separate connection: these rows must already be committed.
+            visibleInstances = await ctx.instances();
+            return Err(schedulingError);
+        });
+
+        const result = await ctx.deploy([scheduled]);
+        expect(result.isErr()).toBe(true);
+        if (result.isErr()) {
+            expect(result.error.cause).toBe(schedulingError);
+        }
+        expect(ctx.orchestrator.scheduleFunctions).toHaveBeenCalledTimes(1);
+        expect(visibleInstances).toEqual([expect.objectContaining({ nango_connection_id: ctx.connection.id, variant: 'base', deleted_at: null })]);
+        const requestedInstances = ctx.orchestrator.scheduleFunctions.mock.calls[0]![0].map(({ instance }) => instance);
+        expect(visibleInstances).toEqual(requestedInstances);
+        expect(await ctx.instances()).toEqual(visibleInstances);
+    });
+
+    it('retries scheduling unchanged functions with the same instances after a scheduling failure', async () => {
+        const ctx = await setup();
+        ctx.orchestrator.scheduleFunctions.mockResolvedValueOnce(Err(new Error('orchestrator unavailable')));
+
+        expect((await ctx.deploy([scheduled])).isErr()).toBe(true);
+        const committed = await ctx.instances();
+        expect(committed).toHaveLength(1);
+
+        (await ctx.deploy([scheduled])).unwrap();
+        expect(await ctx.instances()).toEqual(committed);
+        expect(ctx.orchestrator.scheduleFunctions).toHaveBeenCalledTimes(2);
+        const retriedInstanceIds = ctx.orchestrator.scheduleFunctions.mock.calls[1]![0].map(({ instance }) => instance.id);
+        expect(retriedInstanceIds).toEqual(committed.map((instance) => instance.id));
+    });
+
+    it.each(['trigger change', 'config removal'])('rolls back and retries %s when schedule deletion fails', async (reason) => {
+        const ctx = await setup();
+        (await ctx.deploy([scheduled])).unwrap();
+        const before = await ctx.instances();
+        const functions = reason === 'trigger change' ? [githubArtifact] : [];
+        ctx.orchestrator.deleteFunctionSchedules.mockResolvedValueOnce(Err(new Error('orchestrator unavailable')));
+
+        expect((await ctx.deploy(functions)).isErr()).toBe(true);
+        expect(await ctx.instances()).toEqual(before);
+
+        (await ctx.deploy(functions)).unwrap();
+        const expectedDeletion = {
+            environmentId: ctx.environment.id,
+            instanceIds: before.map((instance) => instance.id)
+        };
+        expect(ctx.orchestrator.deleteFunctionSchedules).toHaveBeenCalledTimes(2);
+        expect(ctx.orchestrator.deleteFunctionSchedules).toHaveBeenNthCalledWith(1, expectedDeletion);
+        expect(ctx.orchestrator.deleteFunctionSchedules).toHaveBeenNthCalledWith(2, expectedDeletion);
+        expect((await ctx.instances())[0]?.deleted_at).toBeInstanceOf(Date);
+    });
+
+    it('creates disabled instances without schedules when autoStart is false', async () => {
+        const ctx = await setup();
+        (await ctx.deploy([{ ...scheduled, trigger: { kind: 'schedule', frequency: 'every 5 minutes', autoStart: false } }])).unwrap();
+        expect((await ctx.instances()).map((instance) => instance.enabled)).toEqual([false]);
+        expect(ctx.orchestrator.scheduleFunctions).not.toHaveBeenCalled();
+    });
+
+    it('does not create instances or schedules when a disabled function becomes scheduled', async () => {
+        const ctx = await setup();
+        (await ctx.deploy([githubArtifact])).unwrap();
+        await db.knex.from(CONFIGS_TABLE).where({ environment_id: ctx.environment.id, name: githubArtifact.name }).update({ enabled: false });
+
+        (await ctx.deploy([scheduled])).unwrap();
+
+        const [deployed] = (await search(db.knex, { environmentId: ctx.environment.id, filter: { integrationKey: scheduled.integrationId } })).unwrap();
+        expect(deployed).toMatchObject({
+            config: { enabled: false },
+            currentVersion: { trigger: { kind: 'schedule' } }
+        });
+        expect(await ctx.instances()).toEqual([]);
+        expect(ctx.orchestrator.scheduleFunctions).not.toHaveBeenCalled();
+    });
+});
+
+describe(prepareDeploymentBundle, () => {
+    beforeAll(async () => {
+        await multipleMigrations();
+    });
+
+    it('deletes every deployed function for an empty environment-scoped deployment', async () => {
+        const environmentId = await seedEnvironmentWithFunctions();
+
+        const reconciliation = (await prepareDeploymentBundle({ functions: [], environmentId, reconciliationScope: { kind: 'environment' } })).unwrap();
+
+        expect(reconciliation.created).toStrictEqual([]);
+        expect(reconciliation.updated).toStrictEqual([]);
+        expect(reconciliation.unchanged).toStrictEqual([]);
+        expect(reconciliation.deleted.map(({ integration, config }) => ({ integrationId: integration.unique_key, name: config.name }))).toEqual(
+            expect.arrayContaining([
+                { integrationId: githubArtifact.integrationId, name: githubArtifact.name },
+                { integrationId: gitlabArtifact.integrationId, name: gitlabArtifact.name }
+            ])
+        );
+        expect(reconciliation.deleted).toHaveLength(2);
+    });
+
+    it('deletes every deployed function for an empty integration-scoped deployment', async () => {
+        const environmentId = await seedEnvironmentWithFunctions();
+
+        const reconciliation = (
+            await prepareDeploymentBundle({
+                functions: [],
+                environmentId,
+                reconciliationScope: { kind: 'integration', integrationId: githubArtifact.integrationId }
+            })
+        ).unwrap();
+
+        expect(reconciliation.created).toStrictEqual([]);
+        expect(reconciliation.updated).toStrictEqual([]);
+        expect(reconciliation.unchanged).toStrictEqual([]);
+        expect(reconciliation.deleted.map(({ integration, config }) => ({ integrationId: integration.unique_key, name: config.name }))).toStrictEqual([
+            { integrationId: githubArtifact.integrationId, name: githubArtifact.name }
+        ]);
+    });
+
+    it('reconciles only the requested integration for an integration-scoped deployment', async () => {
+        const environmentId = await seedEnvironmentWithFunctions();
+
+        const reconciliation = (
+            await prepareDeploymentBundle({
+                functions: [githubArtifact],
+                environmentId,
+                reconciliationScope: { kind: 'integration', integrationId: githubArtifact.integrationId }
+            })
+        ).unwrap();
+
+        expect(reconciliation).toStrictEqual({ created: [], updated: [], unchanged: [githubArtifact], deleted: [] });
+    });
+
+    it('rejects functions outside the requested integration scope', async () => {
+        const environmentId = await seedEnvironmentWithFunctions();
+
+        const result = await prepareDeploymentBundle({
+            functions: [gitlabArtifact],
+            environmentId,
+            reconciliationScope: { kind: 'integration', integrationId: githubArtifact.integrationId }
+        });
+
+        expect(result.isErr()).toBe(true);
+        if (result.isErr()) {
+            expect(result.error.code).toBe('functions_deployment_error');
+            expect(result.error.cause).toEqual(
+                expect.objectContaining({
+                    message: 'function_integration_scope_mismatch',
+                    cause: {
+                        integrationId: githubArtifact.integrationId,
+                        mismatchedIntegrationIds: [gitlabArtifact.integrationId]
+                    }
+                })
+            );
+        }
+    });
+
+    it('creates a function without deleting its siblings for a function-scoped deployment', async () => {
+        const environmentId = await seedEnvironmentWithFunctions();
+        const newGithubArtifact = { ...githubArtifact, name: 'fetchPullRequests' } satisfies FunctionDeploymentArtifact;
+
+        const reconciliation = (
+            await prepareDeploymentBundle({
+                functions: [newGithubArtifact],
+                environmentId,
+                reconciliationScope: { kind: 'function', integrationId: newGithubArtifact.integrationId, name: newGithubArtifact.name }
+            })
+        ).unwrap();
+
+        expect(reconciliation).toStrictEqual({ created: [newGithubArtifact], updated: [], unchanged: [], deleted: [] });
+    });
+
+    it('updates only the scoped function for a function-scoped deployment', async () => {
+        const environmentId = await seedEnvironmentWithFunctions();
+        const siblingGithubArtifact = { ...githubArtifact, name: 'fetchPullRequests' } satisfies FunctionDeploymentArtifact;
+        await upsert(db.knex, [
+            {
+                environmentId,
+                integrationId: siblingGithubArtifact.integrationId,
+                name: siblingGithubArtifact.name,
+                version: functionVersion(siblingGithubArtifact)
+            }
+        ]);
+        const changedGithubArtifact = { ...githubArtifact, description: 'Fetch all issues' } satisfies FunctionDeploymentArtifact;
+
+        const reconciliation = (
+            await prepareDeploymentBundle({
+                functions: [changedGithubArtifact],
+                environmentId,
+                reconciliationScope: { kind: 'function', integrationId: githubArtifact.integrationId, name: githubArtifact.name }
+            })
+        ).unwrap();
+
+        expect(reconciliation.created).toStrictEqual([]);
+        expect(reconciliation.unchanged).toStrictEqual([]);
+        expect(reconciliation.deleted).toStrictEqual([]);
+        expect(reconciliation.updated.map(({ before, after }) => ({ before: before.config.name, after }))).toStrictEqual([
+            { before: githubArtifact.name, after: changedGithubArtifact }
+        ]);
+    });
+
+    it.each([
+        { label: 'no function', functions: [] },
+        { label: 'another function', functions: [{ ...githubArtifact, name: 'fetchPullRequests' }] },
+        { label: 'the function from another integration', functions: [{ ...githubArtifact, integrationId: gitlabArtifact.integrationId }] },
+        { label: 'an extra function', functions: [githubArtifact, { ...githubArtifact, name: 'fetchPullRequests' }] }
+    ] satisfies { label: string; functions: FunctionDeploymentArtifact[] }[])(
+        'rejects a function-scoped deployment containing $label',
+        async ({ functions }) => {
+            const environmentId = await seedEnvironmentWithFunctions();
+
+            const result = await prepareDeploymentBundle({
+                functions,
+                environmentId,
+                reconciliationScope: { kind: 'function', integrationId: githubArtifact.integrationId, name: githubArtifact.name }
+            });
+
+            expect(result.isErr()).toBe(true);
+            if (result.isErr()) {
+                expect(result.error.code).toBe('functions_deployment_error');
+                expect(result.error.cause).toEqual(expect.objectContaining({ message: 'function_scope_mismatch' }));
+            }
+        }
+    );
+
+    it('rejects a function-scoped deployment for a missing integration', async () => {
+        const environmentId = await seedEnvironmentWithFunctions();
+        const missingArtifact = { ...githubArtifact, integrationId: 'missing' } satisfies FunctionDeploymentArtifact;
+
+        const result = await prepareDeploymentBundle({
+            functions: [missingArtifact],
+            environmentId,
+            reconciliationScope: { kind: 'function', integrationId: missingArtifact.integrationId, name: missingArtifact.name }
+        });
+
+        expect(result.isErr()).toBe(true);
+        if (result.isErr()) {
+            expect(result.error.code).toBe('integration_not_found');
+        }
+    });
+
+    it('reconciles every integration for an environment-scoped deployment', async () => {
+        const environmentId = await seedEnvironmentWithFunctions();
+
+        const reconciliation = (
+            await prepareDeploymentBundle({ functions: [githubArtifact], environmentId, reconciliationScope: { kind: 'environment' } })
+        ).unwrap();
+
+        expect(reconciliation.created).toStrictEqual([]);
+        expect(reconciliation.updated).toStrictEqual([]);
+        expect(reconciliation.unchanged).toStrictEqual([githubArtifact]);
+        expect(reconciliation.deleted.map(({ integration, config }) => ({ integrationId: integration.unique_key, name: config.name }))).toStrictEqual([
+            { integrationId: gitlabArtifact.integrationId, name: gitlabArtifact.name }
+        ]);
+    });
+});

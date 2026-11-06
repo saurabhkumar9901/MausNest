@@ -1,0 +1,230 @@
+import db from '@nangohq/database';
+import { connectionService } from '@nangohq/shared';
+import { Err, Ok } from '@nangohq/utils';
+
+import type { ConnectionIntegrationMatchRow, ConnectionMatch, ConnectionMatchCandidate } from '@nangohq/shared';
+import type {
+    AgentSessionAmbiguousConnectionsPayload,
+    AgentSessionConnectionCandidateReport,
+    AgentSessionConnectionResolutionErrorCode,
+    AgentSessionPinnedConnection,
+    AgentSessionPinnedConnectionNotMatchedPayload,
+    AgentSessionResolvedConnection,
+    AgentSessionResolvedConnections,
+    AgentSessionTenantConnections,
+    AgentSessionUnknownPinnedConnectionsPayload
+} from '@nangohq/types';
+import type { Result } from '@nangohq/utils';
+
+export const CANDIDATE_SAMPLE_SIZE = 10;
+
+/**
+ * Stamped on every connection the agent creates through nango_create_connection, and the only thing
+ * tying that connection back to the session that asked for it.
+ */
+export const AGENT_SESSION_TAG_KEY = 'nango/agent_session';
+
+export class AgentSessionConnectionResolutionError extends Error {
+    public readonly code: AgentSessionConnectionResolutionErrorCode;
+    public readonly payload: Record<string, unknown>;
+
+    constructor({ code, message, payload }: { code: AgentSessionConnectionResolutionErrorCode; message: string; payload: Record<string, unknown> }) {
+        super(message);
+        this.name = 'AgentSessionConnectionResolutionError';
+        this.code = code;
+        this.payload = payload;
+    }
+}
+
+export async function resolveTenantConnections({
+    environmentId,
+    connections
+}: {
+    environmentId: number;
+    connections: AgentSessionTenantConnections;
+}): Promise<Result<AgentSessionResolvedConnections, AgentSessionConnectionResolutionError>> {
+    const tagSelectors = connections.any.map((selector) => selector.tags);
+    const pinnedConnections = connections.pinned.map((pin) => ({ integrationId: pin.integrationId, connectionId: pin.connectionId }));
+
+    const matches = await connectionService.groupConnectionMatchesByIntegration({
+        environmentId,
+        tagSelectors,
+        pinnedConnections,
+        candidateSampleSize: CANDIDATE_SAMPLE_SIZE
+    });
+
+    const verifiedPins: ConnectionMatch[] = [];
+    const missingPins: AgentSessionPinnedConnection[] = [];
+
+    for (const pin of connections.pinned) {
+        const match = matches.find((candidate) => candidate.integration_id === pin.integrationId);
+        const candidate = match?.candidates.find((connection) => connection.connection_id === pin.connectionId);
+
+        if (match && candidate) {
+            verifiedPins.push({ integration_id: match.integration_id, provider: match.provider, candidate });
+        } else {
+            missingPins.push(pin);
+        }
+    }
+
+    // A pin absent from the matches either does not exist or was excluded by the selectors.
+    const existing = await connectionService.findExistingConnections({
+        environmentId,
+        connections: missingPins.map((pin) => ({ integrationId: pin.integrationId, connectionId: pin.connectionId }))
+    });
+
+    const unknownPins: AgentSessionPinnedConnection[] = [];
+    const notMatchedPins: AgentSessionPinnedConnection[] = [];
+
+    for (const pin of missingPins) {
+        const found = existing.find((connection) => connection.integration_id === pin.integrationId && connection.candidate.connection_id === pin.connectionId);
+
+        if (!found) {
+            unknownPins.push(pin);
+        } else if (tagSelectors.length > 0) {
+            notMatchedPins.push(pin);
+        } else {
+            verifiedPins.push(found);
+        }
+    }
+
+    return pickConnectionPerIntegration({ matches, verifiedPins, unknownPins, notMatchedPins });
+}
+
+/** The connection the agent created for this integration, matched on the session tag. */
+export async function findConnectionCreatedForSession({
+    environmentId,
+    sessionId,
+    integrationId
+}: {
+    environmentId: number;
+    sessionId: string;
+    integrationId: string;
+}): Promise<AgentSessionResolvedConnection | null> {
+    const connections = await findConnectionsCreatedForSession({ environmentId, sessionId });
+
+    return Object.hasOwn(connections, integrationId) ? (connections[integrationId] ?? null) : null;
+}
+
+export async function findConnectionsCreatedForSession({
+    environmentId,
+    sessionId
+}: {
+    environmentId: number;
+    sessionId: string;
+}): Promise<AgentSessionResolvedConnections> {
+    const matches = await connectionService.groupConnectionMatchesByIntegration({
+        environmentId,
+        tagSelectors: [{ [AGENT_SESSION_TAG_KEY]: sessionId }],
+        pinnedConnections: [],
+        candidateSampleSize: 1,
+        candidateOrder: 'oldest_first',
+        database: db.knex
+    });
+
+    return Object.fromEntries(
+        matches.flatMap((match) => {
+            const [first] = match.candidates;
+            return first ? [[match.integration_id, toResolvedConnection(match.integration_id, match.provider, first)] as const] : [];
+        })
+    );
+}
+
+export function pickConnectionPerIntegration({
+    matches,
+    verifiedPins,
+    unknownPins,
+    notMatchedPins
+}: {
+    matches: ConnectionIntegrationMatchRow[];
+    verifiedPins: ConnectionMatch[];
+    unknownPins: AgentSessionPinnedConnection[];
+    notMatchedPins: AgentSessionPinnedConnection[];
+}): Result<AgentSessionResolvedConnections, AgentSessionConnectionResolutionError> {
+    if (unknownPins.length > 0) {
+        return Err(unknownPinnedConnectionError(unknownPins));
+    }
+
+    if (notMatchedPins.length > 0) {
+        return Err(pinnedNotMatchedError(notMatchedPins, matches));
+    }
+
+    // Maps rather than plain objects: an integration id of `__proto__` would not become an own
+    // property, and the integration would silently drop out of the result.
+    const resolved = new Map<string, AgentSessionResolvedConnection>();
+    for (const pin of verifiedPins) {
+        resolved.set(pin.integration_id, toResolvedConnection(pin.integration_id, pin.provider, pin.candidate));
+    }
+
+    const ambiguous = new Map<string, AgentSessionAmbiguousConnectionsPayload['integrations'][string]>();
+
+    for (const match of matches) {
+        if (resolved.has(match.integration_id)) {
+            continue;
+        }
+
+        const [onlyCandidate] = match.candidates;
+        if (match.match_count > 1 || !onlyCandidate) {
+            ambiguous.set(match.integration_id, { match_count: match.match_count, candidates: match.candidates.map(toCandidateReport) });
+            continue;
+        }
+
+        resolved.set(match.integration_id, toResolvedConnection(match.integration_id, match.provider, onlyCandidate));
+    }
+
+    if (ambiguous.size > 0) {
+        const payload: AgentSessionAmbiguousConnectionsPayload = { integrations: Object.fromEntries(ambiguous) };
+        return Err(
+            new AgentSessionConnectionResolutionError({
+                code: 'ambiguous_connections',
+                message: `${ambiguous.size} ${ambiguous.size === 1 ? 'integration' : 'integrations'} matched more than one connection. Narrow the connection tags or pin a connection id.`,
+                payload: { ...payload }
+            })
+        );
+    }
+
+    return Ok(Object.fromEntries(resolved));
+}
+
+function unknownPinnedConnectionError(rejected: AgentSessionPinnedConnection[]): AgentSessionConnectionResolutionError {
+    const payload: AgentSessionUnknownPinnedConnectionsPayload = {
+        pinned: rejected.map((pin) => ({ integration_id: pin.integrationId, connection_id: pin.connectionId }))
+    };
+
+    return new AgentSessionConnectionResolutionError({
+        code: 'unknown_pinned_connection',
+        message: `${rejected.length} pinned ${rejected.length === 1 ? 'connection does' : 'connections do'} not exist on the integration given. Check the connection id and the integration id.`,
+        payload: { ...payload }
+    });
+}
+
+function pinnedNotMatchedError(rejected: AgentSessionPinnedConnection[], matches: ConnectionIntegrationMatchRow[]): AgentSessionConnectionResolutionError {
+    const byIntegration = new Map(matches.map((match) => [match.integration_id, match]));
+    const payload: AgentSessionPinnedConnectionNotMatchedPayload = {
+        pinned: rejected.map((pin) => ({
+            integration_id: pin.integrationId,
+            connection_id: pin.connectionId,
+            candidates: (byIntegration.get(pin.integrationId)?.candidates ?? []).map(toCandidateReport)
+        }))
+    };
+
+    return new AgentSessionConnectionResolutionError({
+        code: 'pinned_connection_not_matched',
+        message: `${rejected.length} pinned ${rejected.length === 1 ? 'connection is' : 'connections are'} not among the connections the selectors matched. A pin chooses between matched connections, so widen the selectors or pin one of the candidates.`,
+        payload: { ...payload }
+    });
+}
+
+function toResolvedConnection(integrationId: string, provider: string, candidate: ConnectionMatchCandidate): AgentSessionResolvedConnection {
+    return {
+        integrationId,
+        provider,
+        connectionId: candidate.connection_id,
+        internalConnectionId: candidate.id,
+        configId: candidate.config_id
+    };
+}
+
+function toCandidateReport(candidate: ConnectionMatchCandidate): AgentSessionConnectionCandidateReport {
+    return { connection_id: candidate.connection_id, tags: candidate.tags };
+}

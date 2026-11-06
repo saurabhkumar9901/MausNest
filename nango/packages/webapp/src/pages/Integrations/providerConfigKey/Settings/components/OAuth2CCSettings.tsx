@@ -1,0 +1,50 @@
+import { ScopesInput } from '@/components/patterns/ScopesInput';
+import { usePatchIntegration } from '@/hooks/useIntegration';
+import { usePermissions } from '@/hooks/usePermissions';
+import { useToast } from '@/hooks/useToast';
+import { useStore } from '@/store';
+import { SettingsField } from './SettingsLayout';
+
+import type { GetIntegration } from '@nangohq/types';
+
+export const OAuth2CCSettings: React.FC<{ data: GetIntegration['Success']['data'] }> = ({ data: { integration, template } }) => {
+    const env = useStore((state) => state.env);
+    const { toast } = useToast();
+    const { mutateAsync: patchIntegration } = usePatchIntegration(env, integration.unique_key);
+
+    const { can } = usePermissions();
+    const canEdit = can('environment:integrations:update');
+
+    const isSharedCredentials = Boolean(integration.shared_credentials_id);
+
+    const handleScopesChange = async (scopes: string, countDifference: number) => {
+        try {
+            await patchIntegration({
+                authType: template.auth_mode as Extract<typeof template.auth_mode, 'OAUTH2_CC'>,
+                scopes
+            });
+            if (countDifference > 0) {
+                const plural = countDifference > 1 ? 'scopes' : 'scope';
+                toast({ title: `Added ${countDifference} new ${plural}`, variant: 'success' });
+            } else {
+                toast({ title: `Scope successfully removed`, variant: 'success' });
+            }
+        } catch (err) {
+            toast({ title: 'Failed to update scopes', variant: 'error' });
+            throw err;
+        }
+    };
+
+    return (
+        <SettingsField label="Scopes" htmlFor="scopes">
+            <ScopesInput
+                scopesString={integration.oauth_scopes || ''}
+                onChange={handleScopesChange}
+                isSharedCredentials={isSharedCredentials}
+                readOnly={!canEdit}
+                availableScopes={template.available_scopes}
+                showAvailableScopesDropdown={true}
+            />
+        </SettingsField>
+    );
+};

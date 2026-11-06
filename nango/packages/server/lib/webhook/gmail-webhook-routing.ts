@@ -1,0 +1,172 @@
+import crypto from 'node:crypto';
+
+import { getFlags } from '@nangohq/feature-flags';
+import { environmentService, getGlobalWebhookReceiveUrl, NangoError } from '@nangohq/shared';
+import { Err, getLogger, Ok, report } from '@nangohq/utils';
+
+import { hashEmailAddress } from '../utils/pii.js';
+import { getGoogleJWKS } from './cache.js';
+
+import type { WebhookHandler } from './types.js';
+import type { IntegrationConfig } from '@nangohq/types';
+
+const logger = getLogger('Webhook.Gmail');
+
+interface DecodedDataObject {
+    emailAddress: string;
+    historyId: string;
+}
+
+export async function validate(
+    integration: IntegrationConfig,
+    headers: Record<string, any>,
+    { allowUnauthorized }: { allowUnauthorized: boolean }
+): Promise<boolean> {
+    try {
+        const authHeader: string | undefined = headers['authorization'];
+
+        if (!authHeader) {
+            return allowUnauthorized;
+        }
+
+        if (!authHeader.startsWith('Bearer ')) {
+            return false;
+        }
+
+        const token = authHeader.split(' ')[1];
+        if (!token) {
+            logger.warning('No JWT token found in Authorization header');
+            return false;
+        }
+
+        const [headerB64, payloadB64, signatureB64] = token.split('.');
+        if (!headerB64 || !payloadB64 || !signatureB64) {
+            return false;
+        }
+
+        const header = JSON.parse(Buffer.from(headerB64, 'base64url').toString('utf8'));
+        const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+        const signedData = `${headerB64}.${payloadB64}`;
+        const signature = Buffer.from(signatureB64, 'base64url');
+
+        const jwks = await getGoogleJWKS();
+        const jwk = jwks.find((key: Record<string, string>) => key['kid'] === header.kid);
+        if (!jwk) {
+            throw new Error(`No matching JWK found for kid: ${header.kid}`);
+        }
+
+        const pubKey = crypto.createPublicKey({ key: jwk, format: 'jwk' });
+
+        const isVerified = crypto.verify('RSA-SHA256', Buffer.from(signedData), pubKey, signature);
+
+        if (!isVerified) {
+            logger.warning('JWT signature verification failed');
+            return false;
+        }
+
+        const now = Math.floor(Date.now() / 1000);
+        if (payload.iss !== 'https://accounts.google.com') {
+            logger.warning(`Unexpected JWT issuer: ${payload.iss}`);
+            return false;
+        }
+
+        const environment = await environmentService.getById(integration.environment_id);
+        const webhookBase = `${getGlobalWebhookReceiveUrl()}/${environment?.uuid}`;
+        const encodedWebhookUrl = `${webhookBase}/${encodeURIComponent(integration.unique_key)}`;
+        const rawWebhookUrl = `${webhookBase}/${integration.unique_key}`;
+
+        if (payload.aud !== encodedWebhookUrl && payload.aud !== rawWebhookUrl) {
+            const expected = encodedWebhookUrl === rawWebhookUrl ? encodedWebhookUrl : `${encodedWebhookUrl} or ${rawWebhookUrl}`;
+            logger.warning(`Invalid audience. Expected ${expected}, got ${payload.aud}`);
+            return false;
+        }
+
+        if (payload.exp < now) {
+            logger.error('webhook signature invalid');
+            return false;
+        }
+
+        return true;
+    } catch (err: unknown) {
+        report(new Error('Validation error', { cause: err }));
+        return false;
+    }
+}
+
+const route: WebhookHandler = async (nango, headers, body) => {
+    const authHeader = headers['authorization'];
+    const outcome = authHeader ? null : await nango.unverifiedOutcome((accountUuid) => getFlags().allowUnauthorizedGmailWebhook(accountUuid));
+
+    // Counted before validation on purpose, so unsigned pushes that get rejected still show up.
+    if (outcome) {
+        nango.markUnverified(
+            {
+                reason: 'gmail_missing_authorization',
+                remediation: 'Recreate the Pub/Sub push subscription with an OIDC token'
+            },
+            outcome
+        );
+    }
+
+    const valid = await validate(nango.integration, headers, { allowUnauthorized: outcome !== null && outcome !== 'rejected' });
+
+    if (!valid) {
+        logger.error('webhook signature invalid');
+        return Err(new NangoError('webhook_invalid_signature'));
+    }
+
+    let decodedBody: DecodedDataObject | null = null;
+
+    if (typeof body?.message?.data !== 'string') {
+        logger.error('Webhook body is missing message.data', { configId: nango.integration.id });
+        return Err(new NangoError('webhook_invalid_body'));
+    }
+
+    try {
+        decodedBody = JSON.parse(Buffer.from(body.message.data, 'base64').toString('utf8'));
+    } catch (err) {
+        logger.error('Failed to parse webhook body:', err);
+        return Err(new NangoError('webhook_invalid_body'));
+    }
+    const emailAddress = decodedBody?.emailAddress;
+    const editedBodyWithCatchAll = {
+        ...body,
+        type: '*',
+        emailAddress,
+        emailAddressHash: emailAddress ? hashEmailAddress(emailAddress) : undefined
+    };
+
+    let response = await nango.executeScriptForWebhooks({
+        payload: editedBodyWithCatchAll,
+        webhookType: 'type',
+        connectionIdentifier: 'emailAddressHash',
+        propName: 'emailAddressHash'
+    });
+
+    if (response.connectionIds.length === 0) {
+        response = await nango.executeScriptForWebhooks({
+            payload: editedBodyWithCatchAll,
+            webhookType: 'type',
+            connectionIdentifier: 'emailAddress',
+            propName: 'metadata.emailAddress'
+        });
+
+        if (response.connectionIds.length === 0) {
+            response = await nango.executeScriptForWebhooks({
+                payload: editedBodyWithCatchAll,
+                webhookType: 'type',
+                connectionIdentifier: 'emailAddress',
+                propName: 'metadata.email'
+            });
+        }
+    }
+
+    return Ok({
+        content: { status: 'success' },
+        statusCode: 200,
+        connectionIds: response.connectionIds,
+        toForward: body
+    });
+};
+
+export default route;

@@ -1,0 +1,78 @@
+import * as z from 'zod';
+
+import { getFlags } from '@nangohq/feature-flags';
+import { connectionService, getActionOrModelByEndpoint } from '@nangohq/shared';
+import { baseUrl, metrics, zodErrorToHTTP } from '@nangohq/utils';
+
+import { principalCan } from '../../authz/principal.js';
+import { connectionIdSchema, providerConfigKeySchema } from '../../helpers/validation.js';
+import { asyncWrapper, asyncWrapperWithEnvironment } from '../../utils/asyncWrapper.js';
+import { postPublicTriggerAction } from '../action/postTriggerAction.js';
+import { getPublicRecords } from '../records/getRecords.js';
+
+import type { GetPublicV1, HTTP_METHOD } from '@nangohq/types';
+
+const schemaHeaders = z.object({
+    'provider-config-key': providerConfigKeySchema,
+    'connection-id': connectionIdSchema
+});
+
+export const requireV1Passthrough = asyncWrapper<GetPublicV1>(async (_req, res, next) => {
+    if (!(await getFlags().isV1PassthroughEnabled(res.locals.account.uuid))) {
+        res.status(404).send({ error: { code: 'feature_disabled' } });
+        return;
+    }
+    next();
+});
+
+/** @deprecated Use POST /action/trigger to trigger actions and GET /records to fetch sync records instead. */
+export const allPublicV1 = asyncWrapperWithEnvironment<GetPublicV1>(async (req, res, next) => {
+    const valHeaders = schemaHeaders.safeParse(req.headers);
+    if (!valHeaders.success) {
+        res.status(400).send({ error: { code: 'invalid_headers', errors: zodErrorToHTTP(valHeaders.error) } });
+        return;
+    }
+
+    // Can have query params and body depending on if it's an action or a model
+
+    const { account, environment } = res.locals;
+    const environmentId = environment.id;
+    const { 'provider-config-key': providerConfigKey, 'connection-id': connectionId }: GetPublicV1['Headers'] = valHeaders.data;
+
+    metrics.increment(metrics.Types.DEPRECATED_V1_ENDPOINT_USED, 1, {
+        accountId: account.id,
+        environmentId
+    });
+
+    const url = new URL(req.originalUrl, baseUrl);
+    const path = url.pathname.replace(/^\/v1\//, '/');
+
+    const { success, response: connection } = await connectionService.getConnection(connectionId, providerConfigKey, environmentId);
+    if (!success || !connection) {
+        res.status(400).send({ error: { code: 'unknown_connection', message: 'Failed to find connection' } });
+        return;
+    }
+
+    const { action, model } = await getActionOrModelByEndpoint(connection, req.method as HTTP_METHOD, path);
+    if (action) {
+        if (!principalCan(res.locals, 'environment:tools:call')) {
+            res.status(403).json({ error: { code: 'forbidden', message: 'Insufficient scope. Required: environment:tools:call' } });
+            return;
+        }
+        const input = req.body || req.params[1];
+        req.body = {};
+        req.body['action_name'] = action;
+        req.body['input'] = input;
+        await postPublicTriggerAction(req, res, next);
+    } else if (model) {
+        if (!principalCan(res.locals, 'environment:records:read')) {
+            res.status(403).json({ error: { code: 'forbidden', message: 'Insufficient scope. Required: environment:records:read' } });
+            return;
+        }
+        Object.defineProperty(req, 'query', { ...Object.getOwnPropertyDescriptor(req, 'query'), value: req.query, writable: true });
+        req.query['model'] = model;
+        await getPublicRecords(req, res, next);
+    } else {
+        res.status(404).send({ message: `Unknown endpoint '${req.method} ${path}'` });
+    }
+});

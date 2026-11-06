@@ -1,0 +1,661 @@
+import path from 'node:path';
+import { pathToFileURL } from 'url';
+
+import * as z from 'zod';
+
+import { getInterval } from '@nangohq/nango-yaml';
+import { createFunction, deriveFunctionCapabilities, reservedToolTagKeys, toolToFunctionProps } from '@nangohq/runner-sdk';
+
+import { printDebug } from '../utils.js';
+import { Err, Ok } from '../utils/result.js';
+import { detectFeatures, getEntryPoints, readIndexContent, tsToJsPath } from './compile.js';
+import { buildJsonSchemaDefinitionsFromZodModels } from './json-schema.js';
+import { normalizeProjectRelativePath, resolveProjectPath } from './project-path.js';
+import {
+    DuplicateEndpointDefinitionError,
+    DuplicateModelDefinitionError,
+    EndpointMismatchDefinitionError,
+    InvalidIntervalDefinitionError,
+    InvalidModelDefinitionError,
+    TrackDeletesDefinitionError,
+    UnusedCheckpointDefinitionError
+} from './utils.js';
+
+import type {
+    CreateActionResponse,
+    CreateFunctionResponse,
+    CreateOnEventResponse,
+    CreateSyncResponse,
+    CreateToolProps,
+    FunctionRequires,
+    FunctionTriggerDefinition
+} from '@nangohq/runner-sdk';
+import type { ZodCheckpoint, ZodMetadata, ZodModel } from '@nangohq/runner-sdk/lib/types.js';
+import type {
+    DBFunctionConfigVersion,
+    FunctionConcurrencyLimit,
+    FunctionDeploymentArtifact,
+    FunctionTags,
+    NangoYamlParsed,
+    NangoYamlParsedIntegration,
+    ParsedNangoAction,
+    ParsedNangoSync,
+    Result,
+    ToolTags
+} from '@nangohq/types';
+
+// TODO: consolidate with the `server` schemas to have a single source of truth
+const debounceKeySourceSchema = z.union([z.object({ body: z.string() }).strict(), z.object({ header: z.string() }).strict()]);
+const functionTriggerDefinitionSchema = z.discriminatedUnion('kind', [
+    z.object({ kind: z.literal('none') }).strict(),
+    z.object({ kind: z.literal('schedule'), frequency: z.string(), autoStart: z.boolean().optional() }).strict(),
+    z
+        .object({
+            kind: z.literal('http'),
+            subscriptions: z.array(z.string()).optional(),
+            debounce: z
+                .object({
+                    keyBy: z.union([debounceKeySourceSchema, z.array(debounceKeySourceSchema)]).optional(),
+                    windowMs: z.number(),
+                    maxEntities: z.number().optional(),
+                    take: z.enum(['latest', 'first', 'all']).optional()
+                })
+                .strict()
+                .optional()
+        })
+        .strict(),
+    z
+        .object({
+            kind: z.literal('event'),
+            events: z
+                .array(z.enum(['post-connection-creation', 'pre-connection-deletion', 'validate-connection']))
+                .nonempty()
+                .refine((events) => new Set(events).size === events.length, 'Event names must be unique')
+        })
+        .strict()
+]) satisfies z.ZodType<FunctionTriggerDefinition>;
+
+const functionTagStringSchema = z.string().max(64);
+const scopeValuesSchema = z
+    .array(functionTagStringSchema)
+    .min(1)
+    .max(64)
+    .refine((values) => new Set(values).size === values.length, { message: 'Duplicate scopes are not allowed' });
+const requiredScopesSchema = z.union([
+    z.object({ all: scopeValuesSchema }).strict(),
+    z.object({ any: scopeValuesSchema }).strict(),
+    z.object({ none: z.literal(true) }).strict()
+]);
+const functionTagKeySchema = z
+    .string()
+    .regex(/^[a-z][a-z0-9_\-./]*$/, {
+        message: 'Tag keys must start with a lowercase letter and contain only lowercase letters, digits, underscores, hyphens, periods, or slashes'
+    })
+    .max(64);
+const functionTagValueSchema = z.union([functionTagStringSchema, z.array(functionTagStringSchema).max(64)], {
+    error: (iss) => {
+        const got = Array.isArray(iss.input) ? 'array' : iss.input === null ? 'null' : typeof iss.input;
+        return `Expected string or string[], received ${got}`;
+    }
+});
+const functionTagsRecordSchema = z.record(functionTagKeySchema, functionTagValueSchema, {
+    error: (iss) => (iss.code === 'invalid_key' ? iss.issues[0]?.message : undefined)
+});
+export const functionTagsSchema = functionTagsRecordSchema.refine((tags) => Object.keys(tags).length <= 32, {
+    message: 'Functions cannot have more than 32 tags'
+}) satisfies z.ZodType<FunctionTags>;
+
+const toolMetaSchema = z
+    .object({
+        instructions: z.string().max(1024).optional(),
+        requiredScopes: requiredScopesSchema.optional(),
+        tags: functionTagsRecordSchema
+            .refine((tags) => reservedToolTagKeys.every((key) => !(key in tags)), {
+                message: `Tag keys ${reservedToolTagKeys.map((key) => `'${key}'`).join(', ')} are reserved`
+            })
+            .optional()
+    })
+    .strict()
+    .refine((meta) => Object.keys(meta.tags ?? {}).length <= 30, {
+        message: 'Tools cannot have more than 30 tags'
+    });
+const toolNameSchema = z
+    .string()
+    .regex(/^[a-zA-Z0-9_-]+$/, { message: 'Tool names can only contain letters, digits, underscores, or hyphens' })
+    .max(64);
+
+interface FunctionDefinition {
+    description: string;
+    trigger?: FunctionTriggerDefinition | undefined;
+    requires?: FunctionRequires | undefined;
+    limits?: { concurrency?: { perConnection?: FunctionConcurrencyLimit } } | undefined;
+    input?: z.ZodTypeAny | undefined;
+    output?: z.ZodTypeAny | undefined;
+    data?: { models?: Record<string, ZodModel>; metadata?: ZodMetadata; checkpoint?: ZodCheckpoint } | undefined;
+    tags?: FunctionTags | ToolTags | undefined;
+}
+
+type CompiledTool = CreateToolProps<z.ZodTypeAny, z.ZodTypeAny, ZodMetadata, ZodCheckpoint> & { type: 'function'; _nangoFactory: 'tool' };
+
+export type FunctionConfig = Omit<FunctionDeploymentArtifact, 'fileBody'> & { filePath: string };
+
+export interface ParsedEntryPoint {
+    filePath: string;
+    integrationId: string;
+    type: 'sync' | 'action' | 'on-event' | 'function';
+    name: string;
+}
+
+export interface ParsedIntegrationDefinitions extends NangoYamlParsed {
+    functions: FunctionConfig[];
+    entryPoints: ParsedEntryPoint[];
+    hasExperimentalFunctions: boolean;
+}
+
+const allowed = ['action', 'sync', 'onEvent', 'function'];
+
+export async function parseIntegrationDefinitions({ fullPath, debug }: { fullPath: string; debug: boolean }): Promise<Result<ParsedIntegrationDefinitions>> {
+    const parsed: ParsedIntegrationDefinitions = {
+        yamlVersion: 'v2',
+        integrations: [],
+        models: new Map(),
+        functions: [],
+        entryPoints: [],
+        hasExperimentalFunctions: false
+    };
+
+    printDebug('Rebuilding parsed from js files', debug);
+
+    const indexRes = await readIndexContent(fullPath);
+    if (indexRes.isErr()) {
+        return Err(indexRes.error);
+    }
+    const matched = getEntryPoints(indexRes.value);
+    let num = 0;
+
+    for (const matchedFilePath of matched) {
+        num += 1;
+
+        const sourcePath = resolveProjectPath({ projectRoot: fullPath, filePath: matchedFilePath });
+        if (!sourcePath) {
+            return Err(new Error(`Script '${matchedFilePath.replace(/\.js$/, '.ts')}' must be inside the project folder.`));
+        }
+        const filePath = sourcePath.relative;
+        const modulePath = path.join(fullPath, 'build', tsToJsPath(filePath));
+        const moduleUrl = pathToFileURL(modulePath).href;
+        const moduleContent = await import(moduleUrl);
+        if (!moduleContent.default || !moduleContent.default.default) {
+            return Err(new Error(`Script should have a default export ${modulePath}`));
+        }
+        if (!moduleContent.default.default.type || !allowed.includes(moduleContent.default.default.type)) {
+            // createFunction intentionally omitted from this message while experimental. Add on GA
+            return Err(new Error(`Script should be declared using utility function (createSync, createAction, createOnEvent, createTool) ${modulePath}`));
+        }
+
+        printDebug(`Parsing ${filePath}`, debug);
+
+        const script = moduleContent.default.default as
+            | CreateSyncResponse<Record<string, ZodModel>, ZodMetadata, ZodCheckpoint>
+            | CreateActionResponse<z.ZodTypeAny, z.ZodTypeAny, ZodMetadata, ZodCheckpoint>
+            | CreateOnEventResponse
+            | CreateFunctionResponse
+            | CompiledTool;
+
+        const basename = path.basename(filePath, '.js');
+        const realPath = filePath.replace(/\.js$/, '.ts');
+        const absoluteRealPath = sourcePath.absolute.replace(/\.js$/, '.ts');
+        const basenameClean = basename.replaceAll(/[^a-zA-Z0-9]/g, '');
+        const integrationIdRes = getIntegrationId(filePath);
+        if (integrationIdRes.isErr()) {
+            return Err(integrationIdRes.error);
+        }
+        const integrationId = integrationIdRes.value;
+        const integrationIdClean = integrationId.replaceAll(/[^a-zA-Z0-9]/g, '_');
+
+        let integration: NangoYamlParsedIntegration | undefined = parsed.integrations.find((v) => v.providerConfigKey === integrationId);
+        if (!integration) {
+            integration = {
+                providerConfigKey: integrationId,
+                actions: [],
+                syncs: [],
+                onEventScripts: { 'post-connection-creation': [], 'pre-connection-deletion': [], 'validate-connection': [] }
+            };
+            parsed.integrations.push(integration);
+        }
+
+        switch (script.type) {
+            case 'sync': {
+                const parsedSyncRes = parseSync({
+                    filePath: realPath,
+                    absoluteFilePath: absoluteRealPath,
+                    params: script,
+                    integrationIdClean,
+                    basename,
+                    basenameClean
+                });
+                if (parsedSyncRes.isErr()) {
+                    return Err(parsedSyncRes.error);
+                }
+                integration.syncs.push(parsedSyncRes.value);
+                parsed.entryPoints.push({ filePath: realPath, integrationId, type: 'sync', name: basename });
+                break;
+            }
+            case 'action': {
+                const parsedActionRes = parseAction({
+                    filePath: realPath,
+                    absoluteFilePath: absoluteRealPath,
+                    params: script,
+                    integrationIdClean,
+                    basename,
+                    basenameClean
+                });
+                if (parsedActionRes.isErr()) {
+                    return Err(parsedActionRes.error);
+                }
+                integration.actions.push(parsedActionRes.value);
+                parsed.entryPoints.push({ filePath: realPath, integrationId, type: 'action', name: basename });
+                break;
+            }
+            case 'onEvent': {
+                if (script.event === 'post-connection-creation') {
+                    integration.onEventScripts['post-connection-creation'].push(basename);
+                } else if (script.event === 'pre-connection-deletion') {
+                    integration.onEventScripts['pre-connection-deletion'].push(basename);
+                } else if (script.event === 'validate-connection') {
+                    integration.onEventScripts['validate-connection'].push(basename);
+                }
+                parsed.entryPoints.push({ filePath: realPath, integrationId, type: 'on-event', name: basename });
+                break;
+            }
+            case 'function': {
+                const isTool = '_nangoFactory' in script && script._nangoFactory === 'tool';
+                let fnScript: FunctionDefinition = script;
+                let name = basename;
+                if (isTool) {
+                    name = script.name ?? basename;
+                    const validationRes = validateTool({ params: { ...script, name }, filePath: realPath });
+                    if (validationRes.isErr()) {
+                        return Err(validationRes.error);
+                    }
+                    fnScript = createFunction(toolToFunctionProps(script));
+                } else {
+                    const validationRes = validateFunction({ params: script, integrationId, basename });
+                    if (validationRes.isErr()) {
+                        return Err(validationRes.error);
+                    }
+                    parsed.hasExperimentalFunctions = true;
+                }
+
+                if (parsed.functions.some((fn) => fn.integrationId === integrationId && fn.name === name)) {
+                    return Err(
+                        new Error(
+                            isTool
+                                ? `Tool '${realPath}' is named '${name}', which is already used. Tool and function names must be unique per integration.`
+                                : `Function '${integrationId}/functions/${name}.ts' is already defined. Function names must be unique per integration.`
+                        )
+                    );
+                }
+                parsed.functions.push({
+                    ...parseFunction({
+                        params: fnScript,
+                        integrationId,
+                        integrationIdClean,
+                        basename: name,
+                        basenameClean: name.replaceAll(/[^a-zA-Z0-9]/g, '')
+                    }),
+                    filePath: realPath
+                });
+                parsed.entryPoints.push({ filePath: realPath, integrationId, type: 'function', name });
+                break;
+            }
+        }
+    }
+
+    const postValidationRes = postValidation(parsed);
+    if (postValidationRes.isErr()) {
+        return Err(postValidationRes.error);
+    }
+
+    if (num === 0) {
+        return Err(new Error('No export in index.ts'));
+    }
+
+    printDebug('Correctly parsed', debug);
+
+    return Ok(parsed);
+}
+
+export function getIntegrationId(filePath: string): Result<string> {
+    const relativePath = normalizeProjectRelativePath(filePath);
+    if (!relativePath) {
+        return Err(new Error(`Script '${filePath.replace(/\.js$/, '.ts')}' must be inside the project folder.`));
+    }
+    const segments = relativePath.replace(/^\.\//, '').split('/');
+    const integrationId = segments[0];
+    if (!integrationId || segments.length < 2) {
+        return Err(new Error(`Script '${filePath.replace(/\.js$/, '.ts')}' must be inside an integration folder.`));
+    }
+    return Ok(integrationId);
+}
+
+const regexModelName = /^[A-Z][a-zA-Z0-9_]+$/;
+
+export function parseSync({
+    filePath,
+    absoluteFilePath,
+    params,
+    integrationIdClean,
+    basename,
+    basenameClean
+}: {
+    filePath: string;
+    absoluteFilePath: string;
+    params: CreateSyncResponse<Record<string, ZodModel>, ZodMetadata, ZodCheckpoint>;
+    integrationIdClean: string;
+    basename: string;
+    basenameClean: string;
+}): Result<ParsedNangoSync> {
+    // Validation
+    // TODO: We should probably share this with the backend and have a single zod validation
+    const interval = getInterval(params.frequency, new Date());
+    if (interval instanceof Error) {
+        return Err(new InvalidIntervalDefinitionError(filePath, ['createSync', 'frequency']));
+    }
+    if (params.endpoints && Object.keys(params.models).length !== params.endpoints.length) {
+        return Err(new EndpointMismatchDefinitionError(filePath, ['createSync', 'endpoints']));
+    }
+    if (params.syncType === 'incremental' && params.trackDeletes) {
+        return Err(new TrackDeletesDefinitionError(filePath, ['createSync', 'trackDeletes']));
+    }
+
+    if (params.endpoints) {
+        const seen = new Set();
+        for (const endpoint of params.endpoints) {
+            const key = `${endpoint.method} ${endpoint.path}`;
+            if (seen.has(key)) {
+                return Err(new DuplicateEndpointDefinitionError(key, filePath, ['createSync', 'endpoints']));
+            }
+            seen.add(key);
+        }
+    }
+
+    for (const modelName of Object.keys(params.models)) {
+        if (!regexModelName.test(modelName)) {
+            return Err(new InvalidModelDefinitionError(modelName, filePath, ['createSync', 'models']));
+        }
+    }
+
+    const allZodModels: Record<string, z.ZodType> = { ...params.models };
+    const metadataModelName = params.metadata ? `SyncMetadata_${integrationIdClean}_${basenameClean}` : null;
+    if (params.metadata && metadataModelName) {
+        // Add metadata model
+        allZodModels[metadataModelName] = params.metadata;
+    }
+    const outputNames = Object.keys(params.models);
+    const jsonSchema = buildJsonSchemaDefinitionsFromZodModels(allZodModels);
+
+    const featuresRes = detectFeatures({ entryPoint: absoluteFilePath });
+    const features = featuresRes.isOk() ? featuresRes.value : [];
+
+    if (featuresRes.isOk() && params.checkpoint !== undefined && !features.includes('checkpoints')) {
+        return Err(new UnusedCheckpointDefinitionError(filePath, ['createSync', 'checkpoint']));
+    }
+
+    const sync: ParsedNangoSync = {
+        type: 'sync',
+        description: params.description,
+        auto_start: params.autoStart === true,
+        endpoints: params.endpoints ?? [],
+        input: metadataModelName,
+        name: basename,
+        output: outputNames,
+        runs: params.frequency,
+        scopes: params.scopes || [],
+        sync_type: params.syncType || 'full',
+        track_deletes: params.trackDeletes === true,
+        usedModels: Object.keys(allZodModels),
+        version: params.version || '',
+        webhookSubscriptions: params.webhookSubscriptions || [],
+        json_schema: jsonSchema,
+        features
+    };
+
+    return Ok(sync);
+}
+
+export function parseAction({
+    filePath,
+    absoluteFilePath,
+    params,
+    integrationIdClean,
+    basename,
+    basenameClean
+}: {
+    filePath: string;
+    absoluteFilePath: string;
+    params: CreateActionResponse<z.ZodTypeAny, z.ZodTypeAny, ZodMetadata, ZodCheckpoint>;
+    integrationIdClean: string;
+    basename: string;
+    basenameClean: string;
+}): Result<ParsedNangoAction> {
+    const inputName = `ActionInput_${integrationIdClean}_${basenameClean}`;
+    const outputName = `ActionOutput_${integrationIdClean}_${basenameClean}`;
+
+    const allZodModels: Record<string, z.ZodType> = {
+        [inputName]: params.input,
+        [outputName]: params.output
+    };
+
+    const jsonSchema = buildJsonSchemaDefinitionsFromZodModels(allZodModels);
+
+    const featuresRes = detectFeatures({ entryPoint: absoluteFilePath });
+    const features = featuresRes.isOk() ? featuresRes.value : [];
+
+    if (featuresRes.isOk() && params.checkpoint !== undefined && !features.includes('checkpoints')) {
+        return Err(new UnusedCheckpointDefinitionError(filePath, ['createAction', 'checkpoint']));
+    }
+
+    return Ok({
+        type: 'action' as const,
+        description: params.description,
+        endpoint: params.endpoint ?? null,
+        input: inputName,
+        name: basename,
+        output: [outputName],
+        scopes: params.scopes || [],
+        usedModels: [inputName, outputName],
+        version: params.version || '',
+        json_schema: jsonSchema,
+        features
+    });
+}
+
+export function validateFunction({
+    params,
+    integrationId,
+    basename
+}: {
+    params: Pick<FunctionDefinition, 'trigger' | 'input' | 'data' | 'requires' | 'tags'>;
+    integrationId: string;
+    basename: string;
+}): Result<void> {
+    const fnPath = `${integrationId}/functions/${basename}.ts`;
+
+    // TODO: Add support for records.
+    const supportedFunctionTriggerKinds: FunctionTriggerDefinition['kind'][] = ['none', 'http', 'schedule', 'event'];
+
+    if (params.trigger && !supportedFunctionTriggerKinds.includes(params.trigger.kind)) {
+        const supported = supportedFunctionTriggerKinds.map((kind) => `'${kind}'`).join(', ');
+        const allowedText = supported ? `${supported} or no trigger` : 'no trigger';
+        return Err(new Error(`Function '${fnPath}' uses an unsupported trigger kind '${params.trigger.kind}'. Only ${allowedText} is supported for now.`));
+    }
+    if (params.trigger !== undefined) {
+        const triggerValidation = functionTriggerDefinitionSchema.safeParse(params.trigger);
+        if (!triggerValidation.success) {
+            const details = triggerValidation.error.issues
+                .map((issue) => `${issue.path.length > 0 ? `${issue.path.join('.')}: ` : ''}${issue.message}`)
+                .join('; ');
+            return Err(new Error(`Function '${fnPath}' has an invalid trigger definition: ${details}`));
+        }
+    }
+    // TODO: Add support for HTTP trigger options (debounce)
+    if (params.trigger?.kind === 'http' && params.trigger.debounce !== undefined) {
+        return Err(new Error(`Function '${fnPath}' uses unsupported HTTP trigger options: 'debounce'.`));
+    }
+    if ((params.trigger?.kind === 'schedule' || params.trigger?.kind === 'event') && params.input !== undefined) {
+        return Err(new Error(`Function '${fnPath}' declares 'input', which is not supported for ${params.trigger.kind} triggers.`));
+    }
+    if (params.data?.models) {
+        return Err(new Error(`Function '${fnPath}' declares 'data.models', which is not supported yet.`));
+    }
+    if (params.requires?.connection === false) {
+        return Err(new Error(`Function '${fnPath}' is connection-less (requires.connection = false) which is not supported yet.`));
+    }
+    if (params.requires?.invoke === true) {
+        return Err(new Error(`Function '${fnPath}' declares requires.invoke which is not supported yet.`));
+    }
+    if (params.tags !== undefined) {
+        const tagsValidation = functionTagsSchema.safeParse(params.tags);
+        if (!tagsValidation.success) {
+            const details = tagsValidation.error.issues
+                .map((issue) => `${issue.path.length > 0 ? `${issue.path.map((key) => `${JSON.stringify(key)}`).join('')}: ` : ''}${issue.message}`)
+                .join('; ');
+            return Err(new Error(`Function '${fnPath}' has invalid tags: ${details}`));
+        }
+    }
+
+    return Ok(undefined);
+}
+
+export function validateTool({ params, filePath }: { params: Pick<CompiledTool, 'name' | 'meta' | 'data'>; filePath: string }): Result<void> {
+    if (params.data && 'models' in params.data && params.data.models) {
+        return Err(new Error(`Tool '${filePath}' declares 'data.models', which is not supported yet.`));
+    }
+    if (params.name !== undefined) {
+        const nameValidation = toolNameSchema.safeParse(params.name);
+        if (!nameValidation.success) {
+            return Err(new Error(`Tool '${filePath}' has an invalid name: ${formatIssues(nameValidation.error.issues)}`));
+        }
+    }
+    if (params.meta !== undefined) {
+        const metaValidation = toolMetaSchema.safeParse(params.meta);
+        if (!metaValidation.success) {
+            return Err(new Error(`Tool '${filePath}' has invalid meta: ${formatIssues(metaValidation.error.issues)}`));
+        }
+    }
+
+    return Ok(undefined);
+}
+
+function formatIssues(issues: z.core.$ZodIssue[]): string {
+    return issues.map((issue) => `${issue.path.length > 0 ? `${issue.path.map((key) => JSON.stringify(key)).join('')}: ` : ''}${issue.message}`).join('; ');
+}
+
+export function parseFunction({
+    params,
+    integrationId,
+    integrationIdClean,
+    basename,
+    basenameClean
+}: {
+    params: FunctionDefinition;
+    integrationId: string;
+    integrationIdClean: string;
+    basename: string;
+    basenameClean: string;
+}): Omit<FunctionConfig, 'filePath'> {
+    const inputName = params.input ? `FunctionInput_${integrationIdClean}_${basenameClean}` : null;
+    const outputName = params.output ? `FunctionOutput_${integrationIdClean}_${basenameClean}` : null;
+    const metadata = params.data?.metadata;
+    const metadataName = metadata ? `FunctionMetadata_${integrationIdClean}_${basenameClean}` : null;
+    const checkpoint = params.data?.checkpoint;
+    const checkpointName = checkpoint ? `FunctionCheckpoint_${integrationIdClean}_${basenameClean}` : null;
+
+    const allZodModels: Record<string, z.ZodType> = {};
+    if (inputName) {
+        allZodModels[inputName] = params.input as z.ZodType;
+    }
+    if (outputName) {
+        allZodModels[outputName] = params.output as z.ZodType;
+    }
+    if (metadataName && metadata) {
+        allZodModels[metadataName] = metadata;
+    }
+    if (checkpointName && checkpoint) {
+        allZodModels[checkpointName] = checkpoint;
+    }
+    const models = params.data?.models;
+    if (models) {
+        for (const [name, model] of Object.entries(models)) {
+            allZodModels[name] = model as z.ZodType;
+        }
+    }
+
+    const requires: FunctionRequires =
+        params.requires?.connection === false
+            ? { connection: false, outbound: false, invoke: params.requires.invoke === true }
+            : { connection: true, outbound: params.requires?.outbound !== false, invoke: params.requires?.invoke === true };
+
+    const limits: DBFunctionConfigVersion['limits'] =
+        requires.connection === false
+            ? {}
+            : { concurrency: { perConnection: params.trigger?.kind === 'schedule' ? 1 : (params.limits?.concurrency?.perConnection ?? 'max') } };
+    const toSchemaRef = (name: string): string => `#/definitions/${name}`;
+    const toSchemaRefNullable = (name: string | null): string | null => (name ? toSchemaRef(name) : null);
+
+    return {
+        name: basename,
+        integrationId,
+        description: params.description,
+        trigger: params.trigger ?? { kind: 'none' },
+        requires,
+        capabilities: deriveFunctionCapabilities(params),
+        limits,
+        input_schema_ref: toSchemaRefNullable(inputName),
+        output_schema_ref: toSchemaRefNullable(outputName),
+        model_schema_refs: Object.keys(models || {}).map(toSchemaRef),
+        metadata_schema_ref: toSchemaRefNullable(metadataName),
+        checkpoint_schema_ref: toSchemaRefNullable(checkpointName),
+        json_schema: buildJsonSchemaDefinitionsFromZodModels(allZodModels),
+        tags: params.tags ?? {}
+    };
+}
+
+function postValidation(parsed: NangoYamlParsed): Result<void> {
+    for (const integration of parsed.integrations) {
+        const seenEndpoints = new Set<string>();
+        const seenModels = new Set<string>();
+
+        for (const sync of integration.syncs) {
+            for (const model of sync.usedModels) {
+                if (seenModels.has(model)) {
+                    return Err(new DuplicateModelDefinitionError(model, `${integration.providerConfigKey}/syncs/${sync.name}.ts`, ['createSync', 'input']));
+                }
+                seenModels.add(model);
+            }
+
+            for (const endpoint of sync.endpoints) {
+                const key = `${endpoint.method} ${endpoint.path}`;
+                if (seenEndpoints.has(key)) {
+                    return Err(
+                        new DuplicateEndpointDefinitionError(key, `${integration.providerConfigKey}/syncs/${sync.name}.ts`, ['createSync', 'endpoints'])
+                    );
+                }
+                seenEndpoints.add(key);
+            }
+        }
+
+        for (const action of integration.actions) {
+            if (action.endpoint) {
+                const key = `${action.endpoint.method} ${action.endpoint.path}`;
+                if (seenEndpoints.has(key)) {
+                    return Err(
+                        new DuplicateEndpointDefinitionError(key, `${integration.providerConfigKey}/actions/${action.name}.ts`, ['createAction', 'endpoint'])
+                    );
+                }
+                seenEndpoints.add(key);
+            }
+        }
+    }
+    return Ok(undefined);
+}

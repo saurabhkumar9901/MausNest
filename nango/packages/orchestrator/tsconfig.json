@@ -1,0 +1,31 @@
+{
+    "extends": "../../tsconfig.json",
+    "compilerOptions": {
+        "rootDir": "lib",
+        "outDir": "dist"
+    },
+    "references": [
+        {
+            "path": "../feature-flags"
+        },
+        {
+            "path": "../hosted-telemetry"
+        },
+        {
+            "path": "../internal-auth"
+        },
+        {
+            "path": "../kvstore"
+        },
+        {
+            "path": "../types"
+        },
+        {
+            "path": "../utils"
+        },
+        {
+            "path": "../scheduler"
+        }
+    ],
+    "include": ["lib/**/*"]
+}

@@ -1,0 +1,231 @@
+import * as z from 'zod';
+
+import { providerConfigKeySchema, scriptNameSchema } from '../../../../helpers/validation.js';
+
+import type {
+    FunctionDeploymentBundleBody,
+    FunctionReconciliationScope,
+    FunctionTags,
+    FunctionTriggerDefinition,
+    RequiredScopes,
+    ToolTags
+} from '@nangohq/types';
+import type { JSONSchema7 } from 'json-schema';
+
+const schemaReference = z.string().regex(/^#\/definitions\/[a-zA-Z0-9_-]+$/);
+const nullableSchemaReference = schemaReference.nullable();
+const jsonSchema = z.custom<JSONSchema7>((value) => typeof value === 'object' && value !== null && !Array.isArray(value), 'Expected a JSON Schema object');
+const debounceKeySource = z.union([z.object({ body: z.string() }).strict(), z.object({ header: z.string() }).strict()]);
+const tagString = z.string().max(1024);
+const tagKey = z
+    .string()
+    .regex(/^[a-z][a-z0-9_\-./]*$/, {
+        message: 'Tag keys must start with a lowercase letter and contain only lowercase letters, digits, underscores, hyphens, periods, or slashes'
+    })
+    .max(64);
+const tagValue = z.union([tagString, z.array(tagString).max(64)], {
+    error: (iss) => {
+        const got = Array.isArray(iss.input) ? 'array' : iss.input === null ? 'null' : typeof iss.input;
+        return `Expected string or string[], received ${got}`;
+    }
+});
+const requiredScopesGroup = z
+    .tuple([tagString], tagString)
+    .refine((values) => values.length <= 64, { message: 'Required scopes cannot have more than 64 entries' })
+    .refine((values) => new Set(values).size === values.length, { message: 'Duplicate scopes are not allowed' });
+const requiredScopes = z.union(
+    [z.object({ all: requiredScopesGroup }).strict(), z.object({ any: requiredScopesGroup }).strict(), z.object({ none: z.literal(true) }).strict()],
+    {
+        error: 'Expected { all: string[] }, { any: string[] }, or { none: true }'
+    }
+) satisfies z.ZodType<RequiredScopes>;
+const tags = z
+    .object({ required_scopes: requiredScopes.optional() })
+    .catchall(tagValue)
+    .superRefine((tags, ctx) => {
+        for (const key of Object.keys(tags)) {
+            const parsed = tagKey.safeParse(key);
+            if (!parsed.success) {
+                ctx.addIssue({ code: 'custom', message: parsed.error.issues[0]?.message ?? 'Invalid tag key', path: [key] });
+            }
+        }
+    })
+    .refine((tags) => Object.keys(tags).length <= 32, {
+        message: 'Functions cannot have more than 32 tags'
+    }) satisfies z.ZodType<FunctionTags | ToolTags>;
+
+const trigger = z.discriminatedUnion('kind', [
+    z.object({ kind: z.literal('none') }).strict(),
+    z.object({ kind: z.literal('schedule'), frequency: z.string(), autoStart: z.boolean().optional() }).strict(),
+    z
+        .object({
+            kind: z.literal('http'),
+            subscriptions: z.array(z.string()).optional(),
+            debounce: z
+                .object({
+                    keyBy: z.union([debounceKeySource, z.array(debounceKeySource)]).optional(),
+                    windowMs: z.number(),
+                    maxEntities: z.number().optional(),
+                    take: z.enum(['latest', 'first', 'all']).optional()
+                })
+                .strict()
+                .optional()
+        })
+        .strict(),
+    z
+        .object({
+            kind: z.literal('event'),
+            events: z
+                .array(z.enum(['post-connection-creation', 'pre-connection-deletion', 'validate-connection']))
+                .nonempty()
+                .refine((events) => new Set(events).size === events.length, 'Event names must be unique')
+        })
+        .strict()
+]) satisfies z.ZodType<FunctionTriggerDefinition>;
+const requires = z.union([
+    z
+        .object({
+            connection: z.literal(true).optional(),
+            outbound: z.boolean().optional(),
+            invoke: z.boolean().optional()
+        })
+        .strict(),
+    z
+        .object({
+            connection: z.literal(false),
+            outbound: z.literal(false).optional(),
+            invoke: z.boolean().optional()
+        })
+        .strict()
+]);
+const capabilities = z
+    .object({
+        usesRecords: z.boolean(),
+        usesOutbound: z.boolean(),
+        usesCheckpoints: z.boolean(),
+        usesMetadata: z.boolean(),
+        usesInvoke: z.boolean()
+    })
+    .strict();
+const limits = z
+    .object({
+        concurrency: z
+            .object({
+                perConnection: z.union([z.literal(1), z.literal('max')])
+            })
+            .strict()
+            .optional()
+    })
+    .strict();
+
+function referencesDefinition(schema: JSONSchema7, reference: string | null): boolean {
+    return !reference || reference.slice('#/definitions/'.length) in (schema.definitions ?? {});
+}
+
+const functionConfig = z
+    .object({
+        name: scriptNameSchema,
+        integrationId: providerConfigKeySchema,
+        description: z.string().max(2000),
+        tags: tags.default({}),
+        trigger,
+        requires,
+        capabilities,
+        limits,
+        input_schema_ref: nullableSchemaReference,
+        output_schema_ref: nullableSchemaReference,
+        model_schema_refs: z.array(schemaReference),
+        metadata_schema_ref: nullableSchemaReference,
+        checkpoint_schema_ref: nullableSchemaReference,
+        json_schema: jsonSchema,
+        fileBody: z
+            .object({
+                js: z.string().min(1),
+                ts: z.string().min(1)
+            })
+            .strict()
+    })
+    .strict()
+    .refine((fn) => fn.capabilities.usesOutbound === (fn.requires.connection !== false && fn.requires.outbound !== false), {
+        message: 'usesOutbound must match requires.outbound',
+        path: ['capabilities', 'usesOutbound']
+    })
+    .refine((fn) => fn.capabilities.usesRecords === fn.model_schema_refs.length > 0, {
+        message: 'usesRecords must match model_schema_refs',
+        path: ['capabilities', 'usesRecords']
+    })
+    .refine((fn) => fn.capabilities.usesMetadata === (fn.metadata_schema_ref !== null), {
+        message: 'usesMetadata must match metadata_schema_ref',
+        path: ['capabilities', 'usesMetadata']
+    })
+    .refine((fn) => fn.capabilities.usesCheckpoints === (fn.checkpoint_schema_ref !== null), {
+        message: 'usesCheckpoints must match checkpoint_schema_ref',
+        path: ['capabilities', 'usesCheckpoints']
+    })
+    .refine((fn) => fn.capabilities.usesInvoke === (fn.requires.invoke === true), {
+        message: 'usesInvoke must match requires.invoke',
+        path: ['capabilities', 'usesInvoke']
+    })
+    .superRefine((fn, ctx) => {
+        if ((fn.trigger.kind === 'schedule' || fn.trigger.kind === 'event') && fn.input_schema_ref !== null) {
+            ctx.addIssue({ code: 'custom', message: `${fn.trigger.kind} must not declare input`, path: ['input_schema_ref'] });
+        }
+    })
+    .refine(
+        (fn) =>
+            [fn.input_schema_ref, fn.output_schema_ref, ...fn.model_schema_refs, fn.metadata_schema_ref, fn.checkpoint_schema_ref].every((reference) =>
+                referencesDefinition(fn.json_schema, reference)
+            ),
+        {
+            message: 'Schema references must exist in json_schema.definitions',
+            path: ['json_schema', 'definitions']
+        }
+    );
+
+export const validation = z
+    .object({
+        reconciliationScope: z.discriminatedUnion('kind', [
+            z.object({ kind: z.literal('environment') }).strict(),
+            z.object({ kind: z.literal('integration'), integrationId: providerConfigKeySchema }).strict(),
+            z.object({ kind: z.literal('function'), integrationId: providerConfigKeySchema, name: scriptNameSchema }).strict()
+        ]) satisfies z.ZodType<FunctionReconciliationScope>,
+        functions: z.array(functionConfig)
+    })
+    .strict()
+    .refine(
+        (body) => {
+            const keys = body.functions.map((fn) => `${fn.integrationId}:${fn.name}`);
+            return new Set(keys).size === keys.length;
+        },
+        {
+            message: 'Function names must be unique per integration',
+            path: ['functions']
+        }
+    )
+    .refine(
+        (body) => {
+            if (body.reconciliationScope.kind !== 'integration') {
+                return true;
+            }
+            const integrationId = body.reconciliationScope.integrationId;
+            return body.functions.every((fn) => fn.integrationId === integrationId);
+        },
+        {
+            message: 'Functions must match the integration reconciliation scope',
+            path: ['functions']
+        }
+    )
+    .refine(
+        (body) => {
+            if (body.reconciliationScope.kind !== 'function') {
+                return true;
+            }
+            const { integrationId, name } = body.reconciliationScope;
+            const [fn] = body.functions;
+            return body.functions.length === 1 && fn?.integrationId === integrationId && fn.name === name;
+        },
+        {
+            message: 'A function-scoped deployment must contain the scoped function',
+            path: ['functions']
+        }
+    ) satisfies z.ZodType<FunctionDeploymentBundleBody>;

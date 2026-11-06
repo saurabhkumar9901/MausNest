@@ -1,0 +1,148 @@
+import { Err, getLogger, Ok } from '@nangohq/utils';
+
+import { egressTelemetryRecorder } from '../utils/egressTelemetry.js';
+import { proxyResponseToMcp } from './mcpProxyFormatter.js';
+import { ProxyResponseFormatError, readProxyResponseBody } from './mcpProxyResponse.js';
+import proxyService from './proxy.service.js';
+
+import type { ProxyQueryParams, ProxyRequestOutput } from './mcpProxySchema.js';
+import type { ProxyServiceError, ProxyServiceResponse } from './proxy.service.js';
+import type { LogContext } from '@nangohq/logs';
+import type { ApiKeyPrincipal, DBEnvironment, DBPlan, DBTeam, HTTP_METHOD, OperationActor } from '@nangohq/types';
+import type { Result } from '@nangohq/utils';
+
+const logger = getLogger('Server.MCP.Proxy');
+
+export type McpProxyError = ProxyServiceError | ProxyResponseFormatError;
+
+export interface McpProxyRequest {
+    account: DBTeam;
+    environment: DBEnvironment;
+    plan: DBPlan | null;
+    integrationId: string;
+    connectionId: string;
+    method: HTTP_METHOD;
+    path: string;
+    queryParams?: ProxyQueryParams | undefined;
+    headers?: Record<string, string> | undefined;
+    body?: unknown;
+    baseUrlOverride?: string | undefined;
+    apiKey?: ApiKeyPrincipal | undefined;
+    retries?: number | undefined;
+    decompress?: boolean | undefined;
+    retryOn?: number[] | undefined;
+    forwardHeadersOnRedirect?: boolean | undefined;
+    actor?: OperationActor | undefined;
+}
+
+export interface McpProxyExecution {
+    /** Created once the request is attributable, so callers can correlate the call with its operation. */
+    logCtx: LogContext | undefined;
+    /** The provider's own status, set only when the provider answered. A failure's status is Nango's, not theirs. */
+    status: number | undefined;
+    /**
+     * `upstream_error` when the provider answered with a 4xx or 5xx. The tool still returns that as a
+     * result, so a caller reading only `result` cannot tell the provider call failed.
+     */
+    outcome: ProxyServiceResponse['outcome'] | undefined;
+    result: Result<ProxyRequestOutput, McpProxyError>;
+}
+
+/**
+ * The single path every MCP proxy caller goes through, so credential handling, the outbound URL
+ * policy, plan capping and the response size limit are enforced once rather than per tool.
+ */
+export async function executeMcpProxyRequest(params: McpProxyRequest): Promise<McpProxyExecution> {
+    const { account, environment, integrationId, connectionId } = params;
+
+    const body = serializeJsonBody(params.body);
+    const headers = withDefaultJsonContentType(params.headers, params.body);
+    const execution = await proxyService.request({
+        account,
+        environment,
+        plan: params.plan,
+        ...(params.apiKey ? { apiKey: params.apiKey } : {}),
+        method: params.method,
+        endpoint: appendQueryParams(params.path, params.queryParams),
+        integrationId,
+        connectionId,
+        headers,
+        body,
+        retries: params.retries,
+        baseUrlOverride: params.baseUrlOverride,
+        decompress: params.decompress,
+        retryOn: params.retryOn,
+        forwardHeadersOnRedirect: params.forwardHeadersOnRedirect,
+        actor: params.actor
+    });
+
+    if (execution.result.isErr()) {
+        return { logCtx: execution.logCtx, status: undefined, outcome: undefined, result: Err(execution.result.error) };
+    }
+
+    const response = execution.result.value;
+    try {
+        const responseBody = await readProxyResponseBody(response);
+        const output = proxyResponseToMcp(response, responseBody);
+        egressTelemetryRecorder.record({
+            accountId: account.id,
+            environmentId: environment.id,
+            environmentName: environment.name,
+            integrationId,
+            connectionId,
+            callsite: 'proxy',
+            egressedBytes: responseBody.length,
+            count: 1
+        });
+        completeProxyResponse(response);
+        return { logCtx: execution.logCtx, status: response.status, outcome: response.outcome, result: Ok(output) };
+    } catch (err) {
+        const error = err instanceof Error ? err : new Error('Failed to format the provider response');
+        void execution.logCtx?.error('Failed to format provider response for MCP', { error });
+        completeProxyResponse(response, error);
+        if (err instanceof ProxyResponseFormatError) {
+            return { logCtx: execution.logCtx, status: response.status, outcome: response.outcome, result: Err(err) };
+        }
+        throw err;
+    }
+}
+
+export function completeProxyResponse(response: Pick<ProxyServiceResponse, 'complete'>, error?: Error): void {
+    void response.complete(error).catch((err: unknown) => {
+        const completionError = err instanceof Error ? err : new Error('Failed to complete MCP proxy response');
+        logger.error('Failed to complete MCP proxy response', { error: completionError });
+    });
+}
+
+// Axios treats falsy primitives as empty request bodies. Serialize MCP JSON primitives here so
+// the shared proxy can sign, canonicalize, and send the exact JSON bytes supplied by the caller.
+function serializeJsonBody(body: unknown): unknown {
+    if (body === undefined || (body !== null && typeof body === 'object')) {
+        return body;
+    }
+    return JSON.stringify(body);
+}
+
+function withDefaultJsonContentType(headers: Record<string, string> | undefined, body: unknown): Record<string, string> | undefined {
+    if (body === undefined || Object.keys(headers ?? {}).some((name) => name.toLowerCase() === 'content-type')) {
+        return headers;
+    }
+    return { ...headers, 'content-type': 'application/json' };
+}
+
+// Appends URL-encoded query parameters to the path, preserving existing parameters and serializing arrays as repeated keys.
+function appendQueryParams(path: string, queryParams: ProxyQueryParams | undefined): string {
+    if (!queryParams || Object.keys(queryParams).length === 0) {
+        return path;
+    }
+
+    const separator = path.includes('?') ? '&' : '?';
+    const searchParams = new URLSearchParams();
+    for (const [name, value] of Object.entries(queryParams)) {
+        const values = Array.isArray(value) ? value : [value];
+        for (const item of values) {
+            searchParams.append(name, String(item));
+        }
+    }
+    return `${path}${separator}${searchParams.toString()}`;
+}

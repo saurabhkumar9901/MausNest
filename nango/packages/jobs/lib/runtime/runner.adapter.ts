@@ -1,0 +1,58 @@
+import { Err, getLogger, Ok } from '@nangohq/utils';
+
+import { mintRunnerDispatchToken, mintTaskAuthToken } from '../internal-auth.js';
+import { getRunner, getRunners } from '../runner/runner.js';
+
+import type { RuntimeAdapter } from './adapter.js';
+import type { NangoProps } from '@nangohq/types';
+import type { Result } from '@nangohq/utils';
+
+const logger = getLogger('RunnerRuntimeAdapter');
+
+export class RunnerRuntimeAdapter implements RuntimeAdapter {
+    async cancel(params: { taskId: string; nangoProps: NangoProps }): Promise<Result<boolean>> {
+        try {
+            const token = await mintRunnerDispatchToken({ taskId: params.taskId, nangoProps: params.nangoProps });
+            const runners = await getRunners(params.nangoProps.team.id, { token });
+            if (runners.isErr()) {
+                return Err(runners.error);
+            }
+            const results = await Promise.allSettled(runners.value.map((runner) => runner.client.abort.mutate({ taskId: params.taskId })));
+            const didAbort = results.some((result) => result.status === 'fulfilled' && result.value);
+            if (!didAbort) {
+                return Err(`Error aborting script for task: ${params.taskId}`);
+            }
+            return Ok(didAbort);
+        } catch (err) {
+            return Err(new Error(`Error aborting script for task: ${params.taskId}`, { cause: err }));
+        }
+    }
+
+    async invoke(params: { taskId: string; nangoProps: NangoProps; code: string; codeParams: object }): Promise<Result<boolean>> {
+        const token = await mintRunnerDispatchToken({ taskId: params.taskId, nangoProps: params.nangoProps });
+        const runner = await getRunner(params.nangoProps.team.id, { token });
+        if (runner.isErr()) {
+            return Err(runner.error);
+        }
+
+        try {
+            const internalAuthToken = await mintTaskAuthToken(params.taskId, params.nangoProps);
+            const res = await runner.value.client.start.mutate({
+                taskId: params.taskId,
+                nangoProps: params.nangoProps,
+                code: params.code,
+                codeParams: params.codeParams,
+                ...(internalAuthToken ? { internalAuthToken } : {})
+            });
+
+            return Ok(res);
+        } catch (err) {
+            logger.error('Nango runner was unable to execute the function', {
+                error: err,
+                taskId: params.taskId,
+                runnerUrl: runner.value.url
+            });
+            return Err(new Error(`Nango runner was unable to execute the function`, { cause: err }));
+        }
+    }
+}

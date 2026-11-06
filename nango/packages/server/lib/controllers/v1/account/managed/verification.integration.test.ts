@@ -1,0 +1,397 @@
+import * as OTPAuth from 'otpauth';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { mfaService, seeders, userService } from '@nangohq/shared';
+import { nanoid, normalizeEmail } from '@nangohq/utils';
+
+import type { runServer as runServerType } from '../../../../utils/tests.js';
+
+const workosMocks = vi.hoisted(() => {
+    process.env['FLAG_MANAGED_AUTH_ENABLED'] = 'true';
+    process.env['WORKOS_API_KEY'] = 'sk_test_123';
+    process.env['WORKOS_CLIENT_ID'] = 'client_test_123';
+    process.env['AUTH_ALLOW_SIGNUP'] = 'true';
+    process.env['NANGO_SERVER_URL'] = 'http://localhost:3003';
+    process.env['NANGO_PUBLIC_SERVER_URL'] = 'http://localhost:3003';
+
+    return {
+        authenticateWithCode: vi.fn(),
+        authenticateWithEmailVerification: vi.fn(),
+        getOrganization: vi.fn()
+    };
+});
+
+vi.mock('../../../../clients/workos.client.js', () => ({
+    getWorkOSClient: () => ({
+        userManagement: {
+            authenticateWithCode: workosMocks.authenticateWithCode,
+            authenticateWithEmailVerification: workosMocks.authenticateWithEmailVerification
+        },
+        organizations: {
+            getOrganization: workosMocks.getOrganization
+        }
+    })
+}));
+
+const route = '/api/v1/account/managed/verification';
+
+type RunServer = typeof runServerType;
+
+let api: Awaited<ReturnType<RunServer>>;
+let runServer: RunServer;
+
+describe(`POST ${route}`, () => {
+    beforeAll(async () => {
+        vi.resetModules();
+        ({ runServer } = await import('../../../../utils/tests.js'));
+        api = await runServer();
+    });
+
+    afterAll(() => {
+        api.server.close();
+        vi.restoreAllMocks();
+    });
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+    });
+
+    it('should redirect invalid WorkOS callback payloads to signin', async () => {
+        const callbackRes = await fetch(`${api.url}/api/v1/login/callback?error=access_denied`, {
+            redirect: 'manual'
+        });
+
+        expect(callbackRes.status).toBe(302);
+        expect(callbackRes.headers.get('location')).toBe('http://localhost:3003/signin?error=sso_session_expired');
+        expect(workosMocks.authenticateWithCode).not.toHaveBeenCalled();
+    });
+
+    it('should not create a managed user while resuming OAuth consent', async () => {
+        const email = `${nanoid()}@example.com`;
+        const returnTo = '/oauth/consent/interaction-id/review';
+        const state = Buffer.from(JSON.stringify({ returnTo })).toString('base64');
+
+        workosMocks.authenticateWithCode.mockResolvedValue({
+            user: { email, firstName: 'Managed', lastName: 'User' },
+            organizationId: undefined
+        });
+
+        const callbackRes = await fetch(`${api.url}/api/v1/login/callback?code=oauth_code_123&state=${encodeURIComponent(state)}`, {
+            redirect: 'manual'
+        });
+
+        expect(callbackRes.status).toBe(302);
+        expect(callbackRes.headers.get('location')).toBe(
+            'http://localhost:3003/signin?error=oauth_signup_not_allowed&next=%2Foauth%2Fconsent%2Finteraction-id%2Freview'
+        );
+        expect(await userService.getUserByEmail(email)).toBeNull();
+    });
+
+    it('should not create an account for a disposable email', async () => {
+        const email = `${nanoid()}@mailinator.com`;
+
+        workosMocks.authenticateWithCode.mockResolvedValue({
+            user: { email, firstName: 'Managed', lastName: 'User' },
+            organizationId: undefined
+        });
+
+        const callbackRes = await fetch(`${api.url}/api/v1/login/callback?code=oauth_code_123`, {
+            redirect: 'manual'
+        });
+
+        expect(callbackRes.status).toBe(302);
+        expect(callbackRes.headers.get('location')).toBe('http://localhost:3003/signin?error=disposable_email');
+        expect(await userService.getUserByEmail(email)).toBeNull();
+    });
+
+    it('should let an existing managed user resume OAuth consent', async () => {
+        const { user } = await seeders.seedAccountEnvAndUser();
+        const returnTo = '/oauth/consent/interaction-id/review';
+        const state = Buffer.from(JSON.stringify({ returnTo })).toString('base64');
+
+        workosMocks.authenticateWithCode.mockResolvedValue({
+            user: { email: user.email, firstName: 'Managed', lastName: 'User' },
+            organizationId: undefined
+        });
+
+        const callbackRes = await fetch(`${api.url}/api/v1/login/callback?code=oauth_code_123&state=${encodeURIComponent(state)}`, {
+            redirect: 'manual'
+        });
+
+        expect(callbackRes.status).toBe(302);
+        expect(callbackRes.headers.get('location')).toBe(`http://localhost:3003${returnTo}`);
+
+        const sessionCookie = callbackRes.headers.getSetCookie()[0]?.split(';')[0];
+        if (!sessionCookie) throw new Error('Managed callback did not set a session cookie');
+        const userRes = await api.fetch('/api/v1/user', { method: 'GET', session: sessionCookie });
+        expect(userRes.res.status).toBe(200);
+        expect(userRes.json).toMatchObject({ data: { id: user.id, email: user.email } });
+    });
+
+    it('should send a new managed user to account discovery when an unsafe destination is discarded', async () => {
+        const email = `${nanoid()}@example.com`;
+        const state = Buffer.from(JSON.stringify({ returnTo: 'https://attacker.example.com/collect' })).toString('base64');
+
+        workosMocks.authenticateWithCode.mockResolvedValue({
+            user: { email, firstName: 'Managed', lastName: 'User' },
+            organizationId: undefined
+        });
+
+        const callbackRes = await fetch(`${api.url}/api/v1/login/callback?code=oauth_code_123&state=${encodeURIComponent(state)}`, {
+            redirect: 'manual'
+        });
+
+        expect(callbackRes.status).toBe(302);
+        expect(callbackRes.headers.get('location')).toBe('http://localhost:3003/onboarding/account-discovery');
+    });
+
+    it('should still send a new user to account discovery on the login after a destination deferred it', async () => {
+        const email = `${nanoid()}@example.com`;
+
+        workosMocks.authenticateWithCode.mockResolvedValue({
+            user: { email, firstName: 'Managed', lastName: 'User' },
+            organizationId: undefined
+        });
+
+        const state = Buffer.from(JSON.stringify({ returnTo: '/team/billing' })).toString('base64');
+        const first = await fetch(`${api.url}/api/v1/login/callback?code=oauth_code_123&state=${encodeURIComponent(state)}`, {
+            redirect: 'manual'
+        });
+        expect(first.headers.get('location')).toBe('http://localhost:3003/team/billing');
+        expect((await userService.getUserByEmail(email))?.account_discovery_pending).toBe(true);
+
+        const second = await fetch(`${api.url}/api/v1/login/callback?code=oauth_code_123`, { redirect: 'manual' });
+        expect(second.headers.get('location')).toBe('http://localhost:3003/onboarding/account-discovery');
+    });
+
+    it('should complete the pending WorkOS email verification flow and create the local user', async () => {
+        const email = `MixedCase-${nanoid()}@Example.com`;
+        const verificationCode = '123456';
+
+        workosMocks.authenticateWithCode.mockRejectedValue({
+            rawData: {
+                code: 'email_verification_required',
+                message: 'Email ownership must be verified before authentication.',
+                pending_authentication_token: 'pending_token_123',
+                email,
+                email_verification_id: 'email_verification_123'
+            }
+        });
+
+        workosMocks.authenticateWithEmailVerification.mockResolvedValue({
+            user: {
+                email,
+                firstName: 'Managed',
+                lastName: 'User'
+            },
+            organizationId: undefined
+        });
+
+        expect(await userService.getUserByEmail(email)).toBeNull();
+
+        const callbackRes = await fetch(`${api.url}/api/v1/login/callback?code=oauth_code_123`, {
+            redirect: 'manual'
+        });
+
+        expect(callbackRes.status).toBe(302);
+        expect(callbackRes.headers.get('location')).toBe('http://localhost:3003/signin/verify');
+
+        const sessionCookie = callbackRes.headers.getSetCookie()[0]?.split(';')[0];
+        expect(sessionCookie).toBeTruthy();
+
+        const getVerificationRes = await api.fetch('/api/v1/account/managed/verification', {
+            method: 'GET',
+            session: sessionCookie!
+        });
+
+        expect(getVerificationRes.res.status).toBe(200);
+        expect(getVerificationRes.json).toStrictEqual({
+            data: {
+                email
+            }
+        });
+
+        const postVerificationRes = await api.fetch('/api/v1/account/managed/verification', {
+            method: 'POST',
+            session: sessionCookie!,
+            body: {
+                code: verificationCode
+            }
+        });
+
+        expect(postVerificationRes.res.status).toBe(200);
+        expect(postVerificationRes.json).toStrictEqual({
+            data: {
+                url: 'http://localhost:3003/onboarding/account-discovery'
+            }
+        });
+
+        expect(workosMocks.authenticateWithEmailVerification).toHaveBeenCalledWith(
+            expect.objectContaining({
+                clientId: 'client_test_123',
+                code: verificationCode,
+                pendingAuthenticationToken: 'pending_token_123'
+            })
+        );
+
+        const createdUser = await userService.getUserByEmail(email);
+        expect(createdUser).toMatchObject({
+            email: normalizeEmail(email),
+            email_verified: true,
+            name: 'Managed User'
+        });
+
+        const verificationAfterSuccess = await api.fetch('/api/v1/account/managed/verification', {
+            method: 'GET',
+            session: sessionCookie!
+        });
+
+        expect(verificationAfterSuccess.res.status).toBe(404);
+        expect(verificationAfterSuccess.json).toStrictEqual({
+            error: {
+                code: 'not_found',
+                message: 'No pending WorkOS email verification was found. Please try signing in with Google again.'
+            }
+        });
+    });
+
+    it('should rethrow unexpected structured WorkOS errors instead of masking them as invalid verification codes', async () => {
+        const email = `${nanoid()}@example.com`;
+
+        workosMocks.authenticateWithCode.mockRejectedValue({
+            rawData: {
+                code: 'email_verification_required',
+                message: 'Email ownership must be verified before authentication.',
+                pending_authentication_token: 'pending_token_123',
+                email,
+                email_verification_id: 'email_verification_123'
+            }
+        });
+
+        workosMocks.authenticateWithEmailVerification.mockRejectedValue({
+            rawData: {
+                code: 'rate_limit_exceeded',
+                message: 'Too many requests'
+            }
+        });
+
+        const callbackRes = await fetch(`${api.url}/api/v1/login/callback?code=oauth_code_123`, {
+            redirect: 'manual'
+        });
+
+        const sessionCookie = callbackRes.headers.getSetCookie()[0]?.split(';')[0];
+        expect(sessionCookie).toBeTruthy();
+
+        const postVerificationRes = await api.fetch('/api/v1/account/managed/verification', {
+            method: 'POST',
+            session: sessionCookie!,
+            body: {
+                code: '123456'
+            }
+        });
+
+        expect(postVerificationRes.res.status).toBe(500);
+        expect(postVerificationRes.json).toMatchObject({
+            error: {
+                code: 'generic_error_support'
+            }
+        });
+    });
+
+    it('should challenge MFA before completing a managed auth login', async () => {
+        const { user } = await seeders.seedAccountEnvAndUser();
+        const enrollment = (await mfaService.startEnrollment(user.id, user.email)).unwrap();
+        const totp = OTPAuth.URI.parse(enrollment.otpauthUri) as OTPAuth.TOTP;
+        (await mfaService.activateEnrollment(user.id, totp.generate())).unwrap();
+
+        workosMocks.authenticateWithCode.mockResolvedValue({
+            user: { email: user.email, firstName: 'Managed', lastName: 'User' },
+            organizationId: undefined
+        });
+
+        const callbackRes = await fetch(`${api.url}/api/v1/login/callback?code=oauth_code_123`, {
+            redirect: 'manual'
+        });
+
+        expect(callbackRes.status).toBe(302);
+        expect(callbackRes.headers.get('location')).toBe('http://localhost:3003/signin/mfa');
+
+        const sessionCookie = callbackRes.headers.getSetCookie()[0]?.split(';')[0];
+        expect(sessionCookie).toBeTruthy();
+
+        const beforeVerification = await api.fetch('/api/v1/account/mfa', { method: 'GET', session: sessionCookie! });
+        expect(beforeVerification.res.status).toBe(401);
+
+        const verification = await api.fetch('/api/v1/account/mfa/login/verify', {
+            method: 'POST',
+            session: sessionCookie!,
+            // A fresh window, the activation code above is already consumed
+            body: { type: 'code', code: totp.generate({ timestamp: Date.now() + 30_000 }) }
+        });
+
+        expect(verification.res.status).toBe(200);
+        expect(verification.json).toMatchObject({ data: { url: '/', user: { email: user.email } } });
+    });
+
+    it('should not challenge MFA when the user has no active factor', async () => {
+        const { user } = await seeders.seedAccountEnvAndUser();
+
+        workosMocks.authenticateWithCode.mockResolvedValue({
+            user: { email: user.email, firstName: 'Managed', lastName: 'User' },
+            organizationId: undefined
+        });
+
+        const callbackRes = await fetch(`${api.url}/api/v1/login/callback?code=oauth_code_123`, {
+            redirect: 'manual'
+        });
+
+        expect(callbackRes.status).toBe(302);
+        expect(callbackRes.headers.get('location')).toBe('http://localhost:3003/');
+    });
+    it('reads current ad context at Google completion and does not resend it on returning login', async () => {
+        const { envs } = await import('../../../../env.js');
+        const { productTracking } = await import('@nangohq/shared');
+        const previous = envs.SIGNUP_AD_CONTEXT_ENABLED;
+        const previousCookieName = envs.SIGNUP_AD_CONTEXT_COOKIE_NAME;
+        envs.SIGNUP_AD_CONTEXT_ENABLED = true;
+        envs.SIGNUP_AD_CONTEXT_COOKIE_NAME = 'nango_signup_ads_test';
+        const track = vi.spyOn(productTracking, 'track');
+        const email = `${nanoid()}@example.com`;
+        const now = Date.now();
+        const context = {
+            version: 1,
+            marketing: true,
+            gpc: false,
+            method: 'implied',
+            gdpr: false,
+            lgpd: false,
+            ccpa: true,
+            observedAt: now,
+            opprefAt: now - 60_000,
+            oppref: 'synthetic_google_flow'
+        };
+        const headers = { Cookie: `${envs.SIGNUP_AD_CONTEXT_COOKIE_NAME}=${encodeURIComponent(JSON.stringify(context))}` };
+        workosMocks.authenticateWithCode.mockResolvedValue({ user: { email, firstName: 'Ad', lastName: 'Fixture' }, organizationId: undefined });
+        try {
+            const first = await fetch(`${api.url}/api/v1/login/callback?code=synthetic_code`, { redirect: 'manual', headers });
+            expect(first.status).toBe(302);
+            expect(track.mock.calls.filter(([e]) => e.name === 'auth:account_create')).toHaveLength(1);
+            expect(track).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    name: 'auth:account_create',
+                    eventProperties: expect.objectContaining({
+                        advertising_oppref: 'synthetic_google_flow',
+                        advertising_consent_method: 'implied'
+                    })
+                })
+            );
+            const second = await fetch(`${api.url}/api/v1/login/callback?code=synthetic_code`, { redirect: 'manual', headers });
+            expect(second.status).toBe(302);
+            expect(track.mock.calls.filter(([e]) => e.name === 'auth:account_create')).toHaveLength(1);
+        } finally {
+            envs.SIGNUP_AD_CONTEXT_ENABLED = previous;
+            envs.SIGNUP_AD_CONTEXT_COOKIE_NAME = previousCookieName;
+            track.mockRestore();
+        }
+    });
+});

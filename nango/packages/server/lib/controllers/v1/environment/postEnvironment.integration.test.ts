@@ -1,0 +1,69 @@
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+
+import db from '@nangohq/database';
+import { environmentService, seeders, updatePlan } from '@nangohq/shared';
+
+import { authenticateUser, isError, runServer, shouldBeProtected } from '../../../utils/tests.js';
+
+let api: Awaited<ReturnType<typeof runServer>>;
+
+const endpoint = '/api/v1/environments';
+
+describe(`POST ${endpoint}`, () => {
+    beforeAll(async () => {
+        api = await runServer();
+    });
+    afterAll(() => {
+        api.server.close();
+    });
+
+    it('should be protected', async () => {
+        const res = await api.fetch(endpoint, {
+            method: 'POST',
+            body: { name: 'test' }
+        });
+
+        shouldBeProtected(res);
+    });
+
+    it('should not allow environment name to be the same as an existing environment', async () => {
+        const { env, plan, user } = await seeders.seedAccountEnvAndUser();
+        const session = await authenticateUser(api, user);
+        await updatePlan(db.knex, { id: plan.id, environments_max: 10 });
+        await environmentService.createEnvironment(db.knex, { accountId: env.account_id, name: 'existing' });
+
+        const res = await api.fetch(endpoint, {
+            method: 'POST',
+            body: { name: 'existing' },
+            session
+        });
+
+        isError(res.json);
+        expect(res.json).toStrictEqual<typeof res.json>({
+            error: {
+                code: 'conflict',
+                message: 'Environment already exists'
+            }
+        });
+    });
+
+    it('should limit the number of environments based on environments_max flag', async () => {
+        const { plan, user } = await seeders.seedAccountEnvAndUser();
+        const session = await authenticateUser(api, user);
+        await updatePlan(db.knex, { id: plan.id, environments_max: 1 });
+
+        const res = await api.fetch(endpoint, {
+            method: 'POST',
+            body: { name: 'dev' },
+            session
+        });
+
+        isError(res.json);
+        expect(res.json).toStrictEqual<typeof res.json>({
+            error: {
+                code: 'resource_capped',
+                message: 'Maximum number of environments reached'
+            }
+        });
+    });
+});

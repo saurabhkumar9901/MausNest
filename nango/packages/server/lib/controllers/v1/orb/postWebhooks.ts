@@ -1,0 +1,204 @@
+import { billing } from '@nangohq/billing';
+import db from '@nangohq/database';
+import { accountService, handlePlanChanged, updatePlanByTeam } from '@nangohq/shared';
+import { Err, getLogger, Ok, report } from '@nangohq/utils';
+
+import { envs } from '../../../env.js';
+import { trackPlanUpdate } from '../../../services/planChange.service.js';
+import { clearSpendAlertOnPlanChange, notifySpendAlert } from '../../../services/spendAlertNotification.service.js';
+import { asyncWrapper } from '../../../utils/asyncWrapper.js';
+
+import type { PostOrbWebhooks, Result } from '@nangohq/types';
+
+const logger = getLogger('Server.Orb');
+
+/**
+ * Orb is sending webhooks when subscription changes or else
+ *
+ * Forward locally with:
+ * lt --port 3003
+ */
+export const postOrbWebhooks = asyncWrapper<PostOrbWebhooks>(async (req, res) => {
+    if (!envs.ORB_API_KEY || !envs.ORB_WEBHOOKS_SECRET) {
+        res.status(403).send({ error: { code: 'feature_disabled', message: 'feature disabled' } });
+        return;
+    }
+
+    const verified = billing.verifyWebhookSignature(req.rawBody || '', req.headers, envs.ORB_WEBHOOKS_SECRET);
+    if (verified.isErr()) {
+        res.status(400).send({ error: { code: 'invalid_headers', message: 'invalid signature' } });
+        return;
+    }
+    const handled = await handleWebhook(req.body as BaseWebhookEvent);
+    if (handled.isErr()) {
+        report(handled.error, { body: req.body });
+        res.status(500).send({ error: { code: 'server_error', message: handled.error.message } });
+        return;
+    }
+
+    res.status(200).send({ success: true });
+});
+
+interface BaseWebhookEvent {
+    id: string;
+    created_at: string;
+    type: string;
+}
+
+interface SubscriptionEvent extends BaseWebhookEvent {
+    subscription: {
+        id: string;
+        customer: { id: string; external_customer_id: string };
+        plan: { id: string; external_plan_id: string };
+    };
+}
+
+interface SubscriptionStartedEvent extends SubscriptionEvent {
+    type: 'subscription.started';
+}
+
+interface SubscriptionPlanChangedEvent extends SubscriptionEvent {
+    type: 'subscription.plan_changed';
+}
+
+interface SubscriptionCostExceededEvent extends SubscriptionEvent {
+    type: 'subscription.cost_exceeded';
+    properties: {
+        timeframe_start: string;
+        timeframe_end: string;
+        /** The threshold that was crossed, in major units. */
+        amount_threshold: number;
+    };
+}
+
+interface SubscriptionPlanChangedScheduledEvent extends SubscriptionEvent {
+    type: 'subscription.plan_change_scheduled';
+    properties: {
+        change_date: string;
+        new_plan_id: string;
+        previous_plan_id: string;
+    };
+}
+
+type Webhooks = SubscriptionStartedEvent | SubscriptionPlanChangedEvent | SubscriptionPlanChangedScheduledEvent | SubscriptionCostExceededEvent;
+
+const handledTypes = new Set<string>(['subscription.started', 'subscription.plan_changed', 'subscription.plan_change_scheduled', 'subscription.cost_exceeded']);
+
+function isHandled(body: BaseWebhookEvent): body is Webhooks {
+    return handledTypes.has(body.type);
+}
+
+export async function handleWebhook(body: BaseWebhookEvent): Promise<Result<void>> {
+    if (!isHandled(body)) {
+        logger.info('[orb-hook] ignored', { id: body.id, createdAt: body.created_at, type: body.type });
+        return Ok(undefined);
+    }
+
+    logger.info('[orb-hook]', {
+        id: body.id,
+        createdAt: body.created_at,
+        type: body.type,
+        subscriptionId: body.subscription.id,
+        accountId: body.subscription.customer.external_customer_id,
+        plan: body.subscription.plan.external_plan_id
+    });
+
+    switch (body.type) {
+        case 'subscription.started':
+        case 'subscription.plan_changed': {
+            const teamId = body.subscription.customer.external_customer_id;
+            if (!teamId) {
+                return Err('Received a customer without external id');
+            }
+
+            const team = await accountService.getAccountById(db.knex, parseInt(teamId, 10));
+            if (!team) {
+                return Err('Failed to find team');
+            }
+
+            logger.info(`Sub started for team "${team.id}"`);
+
+            const changed = await handlePlanChanged(db.knex, team, {
+                newPlanCode: body.subscription.plan.external_plan_id,
+                orbCustomerId: body.subscription.customer.id,
+                orbSubscriptionId: body.subscription.id
+            });
+
+            if (changed.isErr()) {
+                return Err(changed.error);
+            }
+
+            const planChange = changed.value;
+            if (planChange) {
+                await clearSpendAlertOnPlanChange({ accountId: team.id, subscriptionId: body.subscription.id });
+                trackPlanUpdate({ team, planChange, isScheduled: true });
+            }
+
+            return Ok(undefined);
+        }
+
+        case 'subscription.plan_change_scheduled': {
+            return await db.knex.transaction(async (trx) => {
+                const planId = body.properties.new_plan_id;
+                if (!planId) {
+                    return Err('Received an empty future plan');
+                }
+
+                const resNewPlan = await billing.getPlanById(planId);
+                if (resNewPlan.isErr()) {
+                    return Err(resNewPlan.error);
+                }
+
+                const teamId = body.subscription.customer.external_customer_id;
+                if (!teamId) {
+                    return Err('Received a customer without external id');
+                }
+
+                const team = await accountService.getAccountById(trx, parseInt(teamId, 10));
+                if (!team) {
+                    return Err('Failed to find team');
+                }
+
+                logger.info(`Sub scheduled for team "${team.id}"`);
+                const updated = await updatePlanByTeam(trx, {
+                    account_id: team.id,
+                    orb_future_plan: resNewPlan.value.external_plan_id,
+                    orb_future_plan_at: new Date(body.properties.change_date)
+                });
+                if (updated.isErr()) {
+                    return Err('Failed to updated plan');
+                }
+
+                return Ok(undefined);
+            });
+        }
+
+        case 'subscription.cost_exceeded': {
+            const teamId = body.subscription.customer.external_customer_id;
+            if (!teamId) {
+                return Err('Received a customer without external id');
+            }
+
+            const team = await accountService.getAccountById(db.knex, parseInt(teamId, 10));
+            if (!team) {
+                return Err('Failed to find team');
+            }
+
+            const timeframeStart = new Date(body.properties.timeframe_start);
+            const timeframeEnd = new Date(body.properties.timeframe_end);
+            if (Number.isNaN(timeframeStart.getTime()) || Number.isNaN(timeframeEnd.getTime()) || timeframeEnd <= timeframeStart) {
+                return Err('Received an invalid timeframe');
+            }
+
+            return await notifySpendAlert({
+                team,
+                crossing: {
+                    thresholdInCents: Math.round(body.properties.amount_threshold * 100),
+                    timeframeStart,
+                    timeframeEnd,
+                    subscriptionId: body.subscription.id
+                }
+            });
+        }
+    }
+}

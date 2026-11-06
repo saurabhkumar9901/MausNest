@@ -1,0 +1,53 @@
+import { makeAuditTarget } from '../../../audit.js';
+import integrationService, { trackIntegrationCreate } from '../../../services/integration.service.js';
+import { defineManagementMcpTool } from '../managementTool.js';
+import { createIntegrationServiceErrorToMcp } from './errors.js';
+import { integrationToMcp } from './formatter.js';
+import { createIntegrationArgumentsSchema, createIntegrationsOutputSchema } from './schema.js';
+
+import type { CreateIntegrationsOutput } from './schema.js';
+
+export const createIntegrationsTool = defineManagementMcpTool<typeof createIntegrationArgumentsSchema, CreateIntegrationsOutput>({
+    name: 'integrations_create',
+    title: 'Create Integration',
+    description: 'Creates an integration in Nango using caller-supplied or Nango-provided developer-app credentials.',
+    inputSchema: createIntegrationArgumentsSchema,
+    outputSchema: createIntegrationsOutputSchema,
+    requiredScopes: { every: ['environment:integrations:create'] },
+    audit: {
+        kind: 'audit',
+        resource: 'integration',
+        action: 'created',
+        scope: 'environment',
+        metadata: ({ args }) => ({ provider: args.provider }),
+        targetFromOutput: ({ output }) => makeAuditTarget('integration', output.data.unique_key)
+    },
+    annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false
+    },
+    async handler({ args, environment, account }) {
+        const result = await integrationService.create({
+            environmentId: environment.id,
+            provider: args.provider,
+            uniqueKey: args.integration_id,
+            credentialSource: args.credential_source,
+            displayName: args.display_name,
+            forwardWebhooks: args.forward_webhooks,
+            ...('credentials' in args ? { credentials: args.credentials } : {}),
+            ...('integration_config' in args ? { integrationConfig: args.integration_config } : {}),
+            environment,
+            team: account
+        });
+
+        if (result.isOk()) {
+            trackIntegrationCreate(result.value.integration, 'mcp', environment);
+        }
+
+        return result
+            .map(({ integration, provider }) => ({ data: integrationToMcp({ integration, provider }) }))
+            .mapError((error) => createIntegrationServiceErrorToMcp(error));
+    }
+});

@@ -1,0 +1,46 @@
+{
+    "name": "@nangohq/node",
+    "version": "0.72.2",
+    "description": "Nango's Node client.",
+    "type": "module",
+    "main": "dist/index.js",
+    "module": "./dist/index.js",
+    "scripts": {
+        "build": "tsup lib/index.ts --format cjs",
+        "prepublishOnly": "npm run build",
+        "copy:license": "node -e \"require('node:fs').copyFileSync('../../LICENSE', 'LICENSE')\"",
+        "prepack": "npm run copy:license"
+    },
+    "exports": {
+        ".": {
+            "require": "./dist/index.cjs",
+            "import": "./dist/index.js",
+            "types": "./dist/index.d.ts"
+        }
+    },
+    "typings": "dist/index.d.ts",
+    "keywords": [],
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/NangoHQ/nango.git",
+        "directory": "packages/node-client"
+    },
+    "license": "Elastic-2.0",
+    "dependencies": {
+        "@nangohq/types": "0.72.2",
+        "axios": "1.20.0"
+    },
+    "engines": {
+        "node": ">=20.0"
+    },
+    "files": [
+        "dist/**/*",
+        "!**/*.json",
+        "README.md"
+    ],
+    "devDependencies": {
+        "vitest": "4.1.11",
+        "esbuild": "0.28.1",
+        "tsup": "8.5.1"
+    }
+}
