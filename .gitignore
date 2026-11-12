@@ -66,3 +66,6 @@ CLAUDE.local.md
 .claude/worktrees/
 .worktrees/
 .pi/
+
+# Playwright MCP artifacts
+.playwright-mcp/

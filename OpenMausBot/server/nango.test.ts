@@ -189,7 +189,7 @@ describe("nango connect sessions", () => {
     );
 
     expect(session).toEqual({
-      connectLink: "http://nango.test/connect/ui?token=connect-token",
+      connectLink: "http://nango.test/connect/ui?token=connect-token&apiURL=http%3A%2F%2Fnango.test",
       token: "connect-token",
       expiresAt: "2030-01-01T00:00:00.000Z",
     });

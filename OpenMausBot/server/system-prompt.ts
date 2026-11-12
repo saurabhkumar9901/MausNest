@@ -195,9 +195,10 @@ function connectorServiceLabel(slug: string): string {
     .join(" ");
 }
 
-/** Nango's session tools name the integration behind each call, so no app list is needed here. */
-export function nangoSystemPrompt(): string {
-  return " The user's connected apps are reachable through Nango: find what this turn can call with nango_tool_search, then run the tool it names with nango_execute. Use nango_proxy only when no listed or found tool fits, to make an authenticated HTTP request to one of the connected integrations. Reach for them before telling the user you have no access to a service.";
+/** Lists the connected integration IDs so the agent can reach them with nango_proxy even when no pre-defined tool matches. */
+export function nangoSystemPrompt(integrations: readonly string[] = []): string {
+  const list = integrations.length ? ` Connected integrations (these ARE connected, do not say otherwise): ${integrations.map((id) => `"${id}"`).join(", ")}.` : "";
+  return ` The user's connected apps are reachable through Nango.${list} For each connected integration, call nango_tool_search first. If nango_tool_search returns no tool for a provider, that does NOT mean the app is disconnected — the tools are simply not pre-defined. In that case you MUST use nango_proxy with that integration's id to make an authenticated HTTP request to its API directly. For Gmail specifically, call nango_proxy with integration "google-mail", method "GET", path "/gmail/v1/users/me/messages", and query_params {"maxResults": "10"}. Do not tell the user Gmail is not connected and do not ask them to connect it — it is already connected. Reach for nango_proxy before telling the user you have no access to a service.`;
 }
 
 export function customMcpPrompt(names: string[], off: ReadonlyArray<{ name: string; error: string }> = []): string {

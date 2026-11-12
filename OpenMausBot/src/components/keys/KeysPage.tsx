@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
-import { ChevronRight, Search } from "lucide-react";
+import { ChevronRight, ExternalLink, Search } from "lucide-react";
 import { useStore, type ConfigStatus } from "@/state/store";
 import { cn } from "@/lib/cn";
 import { scrollParent, scrollWithin } from "@/lib/scroll-within";
@@ -21,11 +21,23 @@ const PANELS: Partial<Record<KeyId, () => ReactNode>> = {
   vps: () => <VpsConnection />,
 };
 
+function NangoSetupLink() {
+  const { state } = useStore();
+  const url = (state.config?.nango?.baseUrl?.trim() || "http://localhost:3003").replace(/\/+$/, "");
+  return (
+    <a href={`${url}/`} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-[12px] leading-4 font-medium text-accent-text hover:underline">
+      {t("keys.nango.setupLink")}
+      <ExternalLink size={11} aria-hidden="true" />
+    </a>
+  );
+}
+
 const EXTRAS: Partial<Record<KeyId, () => ReactNode>> = {
   anthropic: () => <AnthropicEveryClaudeBot />,
   openaiCompat: () => <><OpenAiCompatUrl /><BuiltInReplyWait /><OtherOpenAiCompatServers /></>,
   box: () => <BoatOfferPanel />,
   liveKey: () => <LiveProviderSettings />,
+  nango: () => <NangoSetupLink />,
 };
 
 function connected(entry: KeyEntry, config: ConfigStatus | null | undefined): boolean {

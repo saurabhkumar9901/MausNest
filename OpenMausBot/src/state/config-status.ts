@@ -44,6 +44,8 @@ export interface ConfigStatus {
   budgets?: { monthlyUsd?: number; warnAtPercent?: number };
   billing?: { currency?: string; prices?: Record<string, { inputPerMillion: number; outputPerMillion: number; cachedInputPerMillion?: number }> };
   composio: SavedKey & { mode?: "managed" | "self-hosted" | "unavailable" };
+  /** The Nango environment the bots' connected-app tools come from, and its server address (default http://localhost:3003). */
+  nango?: SavedKey & { baseUrl?: string };
   /** `included`: cloud computers come with Cloud Pro, no key is saved. */
   box: SavedKey & { included?: boolean };
   vps: { configured: boolean; sshAlias: string };

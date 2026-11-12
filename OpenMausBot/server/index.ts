@@ -7947,6 +7947,7 @@ async function beginTurn(
       if (dispatchContext.handoff) handoffs.begin(threadId, dispatchClaimId, dispatchContext.handoff);
 
       const integrations: NonNullable<Parameters<typeof instance.adapter.sendTurn>[0]["integrations"]> = {};
+      let nangoIntegrations: string[] = [];
       let browser: Awaited<ReturnType<typeof browserIntegration>> = null;
       const skills = availableSkills(), phoneOffered = usbPhoneOffered(instance, skills) && !proactive.fence.confines(threadId) && !botApiThread(threadId);
       const selectedSkills = selectBundledSkills(
@@ -7963,7 +7964,10 @@ async function beginTurn(
       }
       if (bot.composio !== false && instance.adapter.capabilities.nangoMcp === true) {
         const bridge = await nangoIntegration(bot, threadId, dispatchClaimId);
-        if (bridge) integrations.nango = bridge;
+        if (bridge) {
+          integrations.nango = bridge;
+          nangoIntegrations = (await nango.connections(cfg).catch(() => [])).map((c) => c.integrationId);
+        }
       }
       // User MCP servers' tools are never pre-allowed: every call rides the normal permission flow.
       if (instance.adapter.capabilities.customMcp === true && !proactive.fence.confines(threadId) && !botApiThread(threadId)) {
@@ -8424,7 +8428,7 @@ async function beginTurn(
         { id: "plan", label: "Surface", text: surfacePrompt({ computer: mountedComputer, browser: Boolean(integrations.browser) }, { pinned: plan.pinned, note: plan.note + vpsUnavailableNote + vmUpdateNote + (computerSkipped && plan.computer !== "off" ? computerSkippedNote(redactSecretsInText(computerSkipped)) : ""), canSelect: computerSelectionTurns.has(threadId), cloudHome: Boolean(CLOUD_HOME), botOpened: plan.botOpened, ownComputer: CLOUD_HOME && integrations.agents && lendingEnabled() ? sharedComputers.known(CLOUD_HOME_LENDER) : undefined }) },
         { id: "cloud-home", label: "My Cloud", text: CLOUD_HOME ? cloudHomePrompt(Boolean(integrations.agents) && lendingEnabled(), syncedFolders(DATA_DIR), sharedComputers.known(CLOUD_HOME_LENDER), CLOUD_PERSONAL) + firstHourHooks.prompt(bot.id, threadId) : "" },
         { id: "composio", label: "Connected apps", text: integrations.composio ? composioSystemPrompt(liveBot?.connectorTools ?? bot.connectorTools) + describeConnectorScopes((liveBot ?? bot).connectorScopes) : "" },
-        { id: "nango", label: "Connected apps (Nango)", text: integrations.nango ? nangoSystemPrompt() : "" },
+        { id: "nango", label: "Connected apps (Nango)", text: integrations.nango ? nangoSystemPrompt(nangoIntegrations) : "" },
         { id: "mcp", label: "MCP servers", text: customMcpPrompt(Object.keys(integrations.custom ?? {}), mcpServersHost.off(bot)) }, { id: "to-connect", label: "Connections to make", text: cloudConnections.prompt(liveBot ?? bot) + teamConnections.prompt(threadId, dispatchClaimId, integrations) },
         { id: "browser", label: "Browser", text: integrations.browser ? browserPromptFor(bot, Boolean(integrations.agents)) : "" },
         { id: "data", label: "Data", text: integrations.data ? BUILT_IN_DATA_SYSTEM_PROMPT : "" },
@@ -11820,6 +11824,7 @@ function configStatus() {
       ...(composio.connectionMode(cfg) === "self-hosted" ? keyHint(cfg.composio?.apiKey) : {}),
       configured: composio.configured(cfg), mode: composio.connectionMode(cfg),
     },
+    nango: { ...keyHint(cfg.nango?.secretKey), configured: nango.configured(cfg), baseUrl: cfg.nango?.baseUrl ?? nango.DEFAULT_BASE_URL },
     box: { ...boat.describeBoatAccount(cfg), ...(boat.boatAccount(cfg)?.included ? {} : keyHint(cfg.box?.token)) },
     vps: { configured: Boolean(vpsSshAlias(cfg)), sshAlias: vpsSshAlias(cfg) ?? "" },
     opencodeGo: { ...keyStatus(cfg.opencodeGo?.apiKey), providerKeys: Object.keys(openCodeProviderKeys(cfg)) },
