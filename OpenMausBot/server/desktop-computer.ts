@@ -52,10 +52,10 @@ export const desktopComputer = createDesktopComputer();
 /** Why a turn cannot use this computer, in words for the person and the bot alike. */
 export function thisComputerNotReady(desktop: DesktopComputer = desktopComputer, platform: NodeJS.Platform = process.platform): string {
   if (!desktop.granted()) {
-    return "Only the OpenMausBot app on this computer can let a bot use it. Open the app here, or let the bot work in its own browser or on a cloud desktop instead.";
+    return "Only the MausNest app on this computer can let a bot use it. Open the app here, or let the bot work in its own browser or on a cloud desktop instead.";
   }
   const reason = desktop.unavailableReason();
-  if (!reason) return `${THIS_COMPUTER_NOT_READY}make sure OpenMausBot has the permissions it asks for, then restart it`;
+  if (!reason) return `${THIS_COMPUTER_NOT_READY}make sure MausNest has the permissions it asks for, then restart it`;
   const permission = platform === "darwin" && /(?:Screen Recording|Accessibility).*required/i.test(reason);
-  return `${THIS_COMPUTER_NOT_READY}${reason}${permission ? ". Relaunch OpenMausBot after granting the missing macOS permission." : ""}`;
+  return `${THIS_COMPUTER_NOT_READY}${reason}${permission ? ". Relaunch MausNest after granting the missing macOS permission." : ""}`;
 }

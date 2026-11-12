@@ -212,7 +212,7 @@ export function lentChromeGuidance(problem: LentChromeProblem, lender: ChromeLen
 - Idle: a joined connection with no bytes from agent-browser for `idleMs()` is destroyed. The sweep runs every `sweepMs ?? 30_000`, and its timers are `unref`'d.
 - Guidance copy (bot-facing; `name` and `device` come from the lender, with "your computer" when there is none):
   - `offline`: `${name} is lent but offline: OpenMausBot on it is closed or the ${device} is asleep. Tell the person in one sentence to open OpenMausBot on that ${device}. Do not switch to another browser.`
-  - `not-lent`: `No computer lends its Chrome to My Cloud now. Tell the person in one sentence to turn on Your Chrome under Settings → MausBot Cloud in OpenMausBot on their Mac or PC.`
+  - `not-lent`: `No computer lends its Chrome to My Cloud now. Tell the person in one sentence to turn on Your Chrome under Settings → MausNest Cloud in OpenMausBot on their Mac or PC.`
   - `no-chrome`: `Chrome on ${name} isn't open with remote debugging on. Tell the person in one sentence to open Chrome on that ${device}, turn on remote debugging at chrome://inspect/#remote-debugging, and allow the connection when Chrome asks.`
   - `unreachable`: `Chrome on ${name} did not accept the connection; it may be waiting for the person to click Allow. Tell them in one sentence to check Chrome on that ${device}.`
   - `not-allowed`: `Someone else wrote in this conversation, so it can't use your Chrome. Start a new conversation to use it.`
@@ -296,7 +296,7 @@ export function lentChromeGuidance(problem: LentChromeProblem, lender: ChromeLen
 - Copy (en.json, exact):
   - `"settings.profiles.myChromeLent": "On My Cloud this is the Chrome on {name}, your {device}. It works while that {device} is awake with OpenMausBot open, in conversations you started yourself."`
   - `"settings.profiles.myChromeLentOffline": "{name} is offline right now."`
-  - `"settings.profiles.myChromeLend": "To use My Chrome on My Cloud, lend it from your Mac or PC: open OpenMausBot there, go to Settings → MausBot Cloud, and turn on Your Chrome."`
+  - `"settings.profiles.myChromeLend": "To use My Chrome on My Cloud, lend it from your Mac or PC: open OpenMausBot there, go to Settings → MausNest Cloud, and turn on Your Chrome."`
   - `"lending.chrome": "Your Chrome"`
   - `"lending.chromeHelp": "Bots on My Cloud can use Chrome on this computer, signed in as you, in your own conversations and routines. That reaches every site you're signed in to. Turn on remote debugging at chrome://inspect/#remote-debugging first; Chrome asks you to allow the connection."`
   - `"lending.chromeUnsupported": "My Cloud is updating. Your bots can use your Chrome once it's done."`

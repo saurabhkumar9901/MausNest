@@ -1,4 +1,4 @@
-// A Team Cloud member's own MausBot: its main chat is that person's, the way a chat they open is. Security: so it is
+// A Team Cloud member's own MausNest: its main chat is that person's, the way a chat they open is. Security: so it is
 // private to them, an admin included, and the notes it wrote into the bot's own folder before (which anyone who sees
 // the bot may read) move to their own layer the first time.
 import { layerId, memberAudience } from "../audience.ts";

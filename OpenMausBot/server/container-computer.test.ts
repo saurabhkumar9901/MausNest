@@ -925,7 +925,7 @@ describe("Cua integration", () => {
 });
 
 describe("containerComputerAction", () => {
-  it("never removes an exact-name container without OpenMausBot ownership labels", async () => {
+  it("never removes an exact-name container without MausNest ownership labels", async () => {
     const fake = runner({
       "/usr/bin/which docker": "docker\n",
       "/usr/bin/which podman": new Error("missing"),
@@ -937,12 +937,12 @@ describe("containerComputerAction", () => {
     });
 
     await expect(containerComputerAction("remove", fake.run, "linux")).rejects.toThrow(
-      /not created by OpenMausBot.*remove it manually/i,
+      /not created by MausNest.*remove it manually/i,
     );
     expect(fake.calls).not.toContain(`docker rm -f ${CONTAINER}`);
   });
 
-  it("removes a verified OpenMausBot container even when its version labels are stale", async () => {
+  it("removes a verified MausNest container even when its version labels are stale", async () => {
     const fake = runner({
       "/usr/bin/which docker": "docker\n",
       "/usr/bin/which podman": new Error("missing"),

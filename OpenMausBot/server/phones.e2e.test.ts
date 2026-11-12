@@ -163,7 +163,7 @@ it("a bot without a grant sees no phone tools", async () => {
   // The owner's own turn, refused for the grant alone.
   const refused = (await rpc(token, "tools/call", { name: "PHONE_LIST_EVENTS", arguments: { from: "2026-10-23T00:00:00+05:30", to: "2026-10-24T00:00:00+05:30" } })).body.result;
   expect(refused.isError).toBe(true);
-  expect(refused.content[0].text).toBe("OpenMausBot did not run this: Scout has not been given access to Phone Calendar. Ask the user to allow it under the bot's Access settings, and do not retry.");
+  expect(refused.content[0].text).toBe("MausNest did not run this: Scout has not been given access to Phone Calendar. Ask the user to allow it under the bot's Access settings, and do not retry.");
 }, 60_000);
 
 it("any bot left on the default hears where the person is talking from: the paired phone's send, or the computer", async () => {
@@ -321,7 +321,7 @@ it("a conversation an outside event's run reported into loses the phone", async 
   expect(after.mcpConfig.mcpServers[PHONE_MCP_SERVER]).toBeUndefined();
 }, 90_000);
 
-it("a send reaches the phone with no card of OpenMausBot's own in the chat: the person taps Send on the phone", async () => {
+it("a send reaches the phone with no card of MausNest's own in the chat: the person taps Send on the phone", async () => {
   await settle();
   const allowed = await phone("PUT", "/api/phones/self", { ...registration("install-0001", PHONE_NAME), capabilities: { calendar: "full", messages: "send" } });
   expect(allowed.status).toBe(200);

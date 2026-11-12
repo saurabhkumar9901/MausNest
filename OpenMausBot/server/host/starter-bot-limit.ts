@@ -2,7 +2,7 @@
 // already exists never goes anywhere, whatever the plan says now.
 import { BOT_LIMIT_CODE, botsTowardLimit, type BotLimitRefusal } from "../../shared/bot-limit.ts";
 
-/** How many bots a Starter Cloud can make, not counting its MausBot. The one number to change. */
+/** How many bots a Starter Cloud can make, not counting its MausNest. The one number to change. */
 export const STARTER_BOT_LIMIT = 5;
 
 export type BotLimitReader = "person" | "bot";

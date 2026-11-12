@@ -268,6 +268,13 @@ function send(session: AgentSession, payload: unknown, transportSessionId: strin
   });
 }
 
+/** The self-hosted Connect UI defaults to api.nango.dev; `apiURL` points it at the server that minted the token. */
+function connectLinkWithApi(link: string, cfg: AppConfig): string {
+  const url = new URL(link);
+  url.searchParams.set("apiURL", baseUrl(cfg));
+  return url.toString();
+}
+
 /** A Connect UI link for the person to authorize apps; no MausNest page is needed to complete it. */
 export async function createConnectSession(
   cfg: AppConfig,
@@ -283,5 +290,5 @@ export async function createConnectSession(
     }),
   });
   const body = connectSessionSchema.parse(await response.json());
-  return { connectLink: body.data.connect_link, token: body.data.token, expiresAt: body.data.expires_at };
+  return { connectLink: connectLinkWithApi(body.data.connect_link, cfg), token: body.data.token, expiresAt: body.data.expires_at };
 }

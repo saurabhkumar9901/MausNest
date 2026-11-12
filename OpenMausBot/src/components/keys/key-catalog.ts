@@ -40,7 +40,7 @@ export interface KeyTarget {
 
 export type KeyId =
   | "openai" | "anthropic" | "xai" | "openrouter" | "mistral" | "cerebras" | "groq" | "greenference" | "meta" | "deepseek" | "opencodeGo" | "opencodeProviders"
-  | "lmStudio" | "openaiCompat" | "liveCalls" | "liveKey" | "elevenlabs" | "fishAudio" | "geminiTts" | "box" | "vps" | "onePassword" | "composio" | "treg" | "postiz"
+  | "lmStudio" | "openaiCompat" | "liveCalls" | "liveKey" | "elevenlabs" | "fishAudio" | "geminiTts" | "box" | "vps" | "onePassword" | "composio" | "nango" | "treg" | "postiz"
   | "jev" | "openrouterHelper" | "workersAi" | "imageOpenai" | "imageCustom";
 
 export type KeyMark = { driverKind: string; preset?: ProviderIconPreset } | { icon: LucideIcon };
@@ -160,6 +160,10 @@ export const KEY_CATALOG: readonly KeyEntry[] = [
       saved: (config) => ({ ...flag((config.composio?.mode ?? "self-hosted") === "self-hosted" ? config.composio : undefined),
         ...(config.composio?.mode === "managed" ? { included: true } : {}) }),
       placeholder: "ak_…", href: "https://dashboard.composio.dev", analytics: "composio", shape: /^ak_/ } },
+  { id: "nango", section: "apps", labelKey: "keys.nango.label", purposeKey: "keys.purpose.nango", name: "Nango", env: ["NANGO_SECRET_KEY"],
+    words: ["nango", "connected apps", "apps", "self-hosted", "oauth", "integrations"], mark: { icon: Server }, kind: "key",
+    target: { patch: (value) => ({ nango: { secretKey: value } }), saved: (config) => flag(config.nango),
+      placeholder: "…", placeholderKey: "keys.nango.placeholder", analytics: "nango", noteKey: "keys.nango.note" } },
   { id: "treg", section: "apps", labelKey: "keys.treg.label", purposeKey: "keys.purpose.treg", name: "treg", env: ["OMB_TREG_KEY"],
     words: ["treg", "research", "x", "twitter", "companies", "people", "funding", "news"], mark: { icon: Search }, kind: "key",
     target: { ...providerKey("treg", { slot: "tregApiKey", placeholder: "…", placeholderKey: "keys.treg.placeholder", href: "https://treg.to", test: "treg", analytics: "treg" }),

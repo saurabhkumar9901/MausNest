@@ -25,7 +25,7 @@ describe("a Starter Cloud's bots", () => {
     expect(STARTER_BOT_LIMIT).toBe(5);
   });
 
-  it("counts every bot but its MausBot, an archived one and one that moved away", () => {
+  it("counts every bot but its MausNest, an archived one and one that moved away", () => {
     expect(botsTowardLimit([{}, { defaultBot: {} }, { hidden: true }, { movedTo: { state: "moved" } }, {}])).toBe(2);
   });
 
@@ -35,7 +35,7 @@ describe("a Starter Cloud's bots", () => {
     expect(onStarter(made(5)).limit()).toBe(5);
   });
 
-  it("leaves the MausBot out of the count", () => {
+  it("leaves the MausNest out of the count", () => {
     expect(onStarter([{ defaultBot: {} }, ...made(4)]).refusal()).toBeNull();
     expect(onStarter([{ defaultBot: {} }, ...made(5)]).refusal()).not.toBeNull();
   });
@@ -80,7 +80,7 @@ describe("where a bot gets made", () => {
   // A new caller here decides what a plan's limit means for it, and adds itself to the gated or exempt list in this test.
   it("is only the paths the limit has an answer for", () => {
     expect(calling(/\.createBot\(/)).toEqual([
-      "default-bot.ts", // a place's MausBot: never counted
+      "default-bot.ts", // a place's MausNest: never counted
       "package-import.ts", // gated before its first record: file imports, templates, the move importer, the org library
       "routes/bots-create.ts", // gated, unless the bot arrives with its own id: a move
       "store.ts", // the store's own seed on an empty place

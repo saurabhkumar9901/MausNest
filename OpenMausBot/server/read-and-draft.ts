@@ -28,7 +28,7 @@ export const READ_AND_DRAFT_PARTS: ReadonlySet<string> = new Set(["user-profile"
  * by call) and the engine's hooks. */
 export const READ_AND_DRAFT_TOOLS: ReadonlySet<string> = new Set(["agents", "composio", "hooks"]);
 
-export const READ_AND_DRAFT_REFUSAL = "This work reads and drafts only: OpenMausBot refused this. Do not try another way.";
+export const READ_AND_DRAFT_REFUSAL = "This work reads and drafts only: MausNest refused this. Do not try another way.";
 const RULE = "read-and-draft";
 
 /** OpenMausBot's own routes a read-and-draft run may reach. */
