@@ -434,7 +434,7 @@ function shownConversations<T extends object>(bot: T, visible: VisibleSet): T {
   return namedSharedChat(out) as T;
 }
 
-/** A team bot's main chat goes by what it is, so nobody takes it for one of their own. A member's own MausBot has none. */
+/** A team bot's main chat goes by what it is, so nobody takes it for one of their own. A member's own MausNest has none. */
 function namedSharedChat(bot: Record<string, unknown>): Record<string, unknown> {
   const main = bot.mainThreadId, tasks = bot.tasks;
   if (typeof main !== "string" || !Array.isArray(tasks) || (bot.defaultBot as { person?: unknown } | undefined)?.person) return bot;

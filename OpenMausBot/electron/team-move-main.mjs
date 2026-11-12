@@ -46,7 +46,7 @@ export function teamMoveConfirmWords({ bot, team }) {
       `Everyone in ${team} can use ${bot}. Only ${team}'s admins can change it.`,
       `Goes with ${bot}: instructions, skills, files, routines, and your chats with ${bot}`,
       "Your chats stay private there: only you can see them.",
-      `Stays on My Cloud: what ${bot} remembers, your connections, and MausBot`,
+      `Stays on My Cloud: what ${bot} remembers, your connections, and MausNest`,
       "There's no way back: you can't move it back to My Cloud.",
     ].join("\n\n"),
     buttons: [`Move to ${team}`, "Cancel"],
@@ -107,7 +107,7 @@ function bearerSession(origin, token, fetchImpl) {
  *   fetch?: typeof fetch,
  *   journal?: { read(): unknown, write(value: unknown): void },
  *   log?(line: string): void,
- * }} deps `home`: My Cloud and the Admin's code for it. `account`: the MausBot Cloud sign-in, whose verified session
+ * }} deps `home`: My Cloud and the Admin's code for it. `account`: the MausNest Cloud sign-in, whose verified session
  * names the person's teams. `file`: the send's own state; `journalFile`: the moves'. `openTeam`: shows the team's page.
  * `pageOrigin`: the origin of the page asking, when it is this window's active server's main frame. `confirmMove`: asks
  * the person outside any page.
@@ -130,7 +130,7 @@ export function installTeamMove({ ipcMain, cloudPage, pageOrigin = () => null, c
       const team = teamOf(move.team.id);
       if (!team) throw new Error(`You're no longer in ${move.team.name}.`);
       const client = account();
-      if (!client) throw new Error("Sign in to MausBot Cloud first.");
+      if (!client) throw new Error("Sign in to MausNest Cloud first.");
       const member = await openOwnerSession({ origin: team.origin, grant: () => client.pairTeam(team.id) }, fetchImpl, { label, background: false });
       try {
         const asked = await member.call("POST", "/api/team-move-in", { v: 1, bot: { id: move.bot.id, name: move.bot.name, ...(facts.threadId ? { threadId: facts.threadId } : {}) },

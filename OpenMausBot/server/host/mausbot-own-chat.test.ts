@@ -19,7 +19,7 @@ function world(starters: Record<string, string> = {}) {
   return { own, starters, moved, bots };
 }
 
-describe("a member's own MausBot's main chat", () => {
+describe("a member's own MausNest's main chat", () => {
   it("becomes its person's, and its notes move to their layer", async () => {
     const w = world();
     expect(await w.own.claimAll()).toBe(1);
@@ -33,7 +33,7 @@ describe("a member's own MausBot's main chat", () => {
     expect(w.starters["t-mira"]).toBe("key:mira@acme.test");
   });
 
-  it("leaves a chat that already has its person, a place's own MausBot and every other bot alone", async () => {
+  it("leaves a chat that already has its person, a place's own MausNest and every other bot alone", async () => {
     const w = world({ "t-mira": "key:someone" });
     expect(await w.own.claimAll()).toBe(0);
     expect(w.own.claim(w.bots[1]!)).toBeNull();

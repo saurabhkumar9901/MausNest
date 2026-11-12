@@ -276,7 +276,7 @@ export function buildDiagnosticsReport({
   now = new Date().toISOString(),
 } = {}) {
   const lines = [];
-  lines.push("OpenMausBot diagnostics");
+  lines.push("MausNest diagnostics");
   lines.push(`Generated: ${now}`);
   lines.push("");
   lines.push("## App");

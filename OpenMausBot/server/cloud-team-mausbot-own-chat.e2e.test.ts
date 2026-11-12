@@ -1,5 +1,5 @@
-// A Team Cloud member's own MausBot: its main chat is theirs alone, on a Team Cloud with the synthetic Claude CLI. No
-// admin or other member reads it through any route, and its notes go to the person's own layer. A MausBot made before
+// A Team Cloud member's own MausNest: its main chat is theirs alone, on a Team Cloud with the synthetic Claude CLI. No
+// admin or other member reads it through any route, and its notes go to the person's own layer. A MausNest made before
 // this gets the same at the next start, its earlier notes moved out of the bot's own folder.
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -56,7 +56,7 @@ afterAll(async () => {
 it("is the person's own: private on the wire, its notes in their layer, and nobody else reads it through any route", async () => {
   const maus = await ownMausBot(mira);
   expect(maus.tasks!.find((task) => task.threadId === maus.threadId)?.private, "her main chat is marked hers").toBe(true);
-  expect((maus as Bot & { mainThreadId?: string }).mainThreadId, "and it is still her MausBot's main chat").toBe(maus.threadId);
+  expect((maus as Bot & { mainThreadId?: string }).mainThreadId, "and it is still her MausNest's main chat").toBe(maus.threadId);
   const other = await team.as(mira, "POST", `/api/bots/${maus.id}/tasks`, { title: "Another chat" });
   expect(other.status).toBe(201);
   expect(((await botsOf(mira)).find((bot) => bot.id === maus.id) as Bot & { mainThreadId?: string }).mainThreadId, "a newer chat of hers doesn't become it").toBe(maus.threadId);
@@ -74,7 +74,7 @@ it("is the person's own: private on the wire, its notes in their layer, and nobo
   for (const token of [olive, ben]) expect(await everything(token, maus)).not.toContain("Kestrel19");
 }, hostTimeout(120_000));
 
-it("a MausBot made before this: at the next start its main chat becomes its person's and its earlier notes move to their layer", async () => {
+it("a MausNest made before this: at the next start its main chat becomes its person's and its earlier notes move to their layer", async () => {
   const maus = await ownMausBot(ben);
   expect((await team.as(ben, "POST", `/api/bots/${maus.id}/messages`, { text: "NO-SCRIPT Heron77 hello", threadId: maus.threadId })).status).toBe(202);
   await expect.poll(async () => JSON.stringify((await team.as(ben, "GET", `/api/threads/${maus.threadId}/messages?limit=50`)).body), { timeout: 60_000 }).toContain("Heron77");

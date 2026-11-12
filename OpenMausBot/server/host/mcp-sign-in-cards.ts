@@ -235,7 +235,7 @@ export function createMcpSignInCards(deps: McpSignInCardDeps) {
      * showed for the same server is set aside, so the chat shows one. */
     request(at: { bot: { name: string }; threadId: string; from?: Message["from"] }, name: string, server: StoredRemoteMcpServer): { posted: true } | Refusal {
       if (!signer(name, at.threadId)) {
-        return { status: 409, error: `${name} is each person's own, and this chat isn't one person's alone, so nobody can sign in to it here. Each person signs in to their own on their team's page in MausBot Cloud.` };
+        return { status: 409, error: `${name} is each person's own, and this chat isn't one person's alone, so nobody can sign in to it here. Each person signs in to their own on their team's page in MausNest Cloud.` };
       }
       const replaced: string[] = [];
       for (const old of store.messagesFor(at.threadId)) {

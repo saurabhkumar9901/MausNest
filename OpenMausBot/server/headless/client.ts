@@ -82,7 +82,7 @@ export async function openClient(flags: Flags, deps: ClientDeps, mutating: boole
     baseUrl = `http://127.0.0.1:${port}`;
   } else {
     if (mutating && deps.requireExplicitForMutations) {
-      throw usageError("mutating commands require an explicit OpenMausBot instance", "start `control-omb launch`, then pass its URL with --url");
+      throw usageError("mutating commands require an explicit MausNest instance", "start `control-omb launch`, then pass its URL with --url");
     }
     if (token) {
       throw usageError("a token needs a named server, so it is never sent while looking for one",
@@ -91,7 +91,7 @@ export async function openClient(flags: Flags, deps: ClientDeps, mutating: boole
     try {
       baseUrl = await mcp.probeBaseUrls(DISCOVERY_PORTS.map((port) => `http://127.0.0.1:${port}`));
     } catch {
-      throw new HeadlessError(`no OpenMausBot server answered on 127.0.0.1 ports ${DISCOVERY_PORTS.join(", ")}`, EXIT.unreachable,
+      throw new HeadlessError(`no MausNest server answered on 127.0.0.1 ports ${DISCOVERY_PORTS.join(", ")}`, EXIT.unreachable,
         "start one with `openmausbot serve`, or name one with --url or OPENMAUSBOT_URL");
     }
   }
@@ -164,7 +164,7 @@ export async function readJob(client: HeadlessClient, threadId: string, query: R
     const status = (error as { status?: number }).status;
     const message = error instanceof Error ? error.message : String(error);
     if (status === 404 && !/no such conversation/.test(message)) {
-      throw new HeadlessError("this OpenMausBot server cannot report a conversation's job", EXIT.unreachable, "update OpenMausBot on the server");
+      throw new HeadlessError("this MausNest server cannot report a conversation's job", EXIT.unreachable, "update MausNest on the server");
     }
     throw error;
   }

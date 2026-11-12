@@ -124,7 +124,7 @@ export function filterToolsListFrame(
 
 const AUTH_CONFIG_PARAMETER = {
   type: "string",
-  description: "Optional, read by OpenMausBot: the id (ac_…) of an auth config in the person's own Composio project to "
+  description: "Optional, read by MausNest: the id (ac_…) of an auth config in the person's own Composio project to "
     + "connect the one listed toolkit with. Leave it out to use their most recently created enabled config for it.",
 };
 

@@ -641,7 +641,7 @@ export function createOneHome(deps) {
     const waiting = () => journal.retryAt > now() && !(cameBack && !journal.hourly);
     if (journal && cloud && cloud.account !== journal.cloud.account) {
       // Another account's Cloud never moves this computer's copy, nor lifts its freeze once the move is done.
-      if (FROZEN.has(journal.phase)) await failed(journal, tagged("Another MausBot Cloud account signed in.", "other_account"), true);
+      if (FROZEN.has(journal.phase)) await failed(journal, tagged("Another MausNest Cloud account signed in.", "other_account"), true);
       await deps.release?.();
       return;
     }
@@ -683,7 +683,7 @@ export function createOneHome(deps) {
     }
     for (let step = 0; journal && step < 12 && !closed && !kept(); step++) {
       // Each step reads My Cloud from the sign-in: none of them ever runs for an account that signed in since the last.
-      if (anotherAccount(journal)) { if (FROZEN.has(journal.phase)) await failed(journal, tagged("Another MausBot Cloud account signed in.", "other_account"), true); break; }
+      if (anotherAccount(journal)) { if (FROZEN.has(journal.phase)) await failed(journal, tagged("Another MausNest Cloud account signed in.", "other_account"), true); break; }
       if (journal.phase === "copy") journal = await copy(journal);
       else if (journal.phase === "wait") journal = await wait(journal);
       else if (journal.phase === "freeze") journal = await freeze(journal);

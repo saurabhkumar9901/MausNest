@@ -506,7 +506,7 @@ export async function listManagedBoats(
     try {
       recoveries = boatCreateRecoverySnapshot();
     } catch {
-      return invalidInventory("OpenMausBot could not safely read its cloud computer recovery records");
+      return invalidInventory("MausNest could not safely read its cloud computer recovery records");
     }
     for (const recovery of recoveries) {
       if (!recovery.resolved || !recovery.boxId) continue;
@@ -520,7 +520,7 @@ export async function listManagedBoats(
       if (matchingRows.length === 1) {
         const listedName = typeof matchingRows[0]?.name === "string" ? matchingRows[0].name : "";
         if (listedName !== namedOwner.currentName && listedName !== namedOwner.legacyName) {
-          return invalidInventory("A remembered cloud computer no longer has its OpenMausBot owner name — repair it in boat.dev before continuing");
+          return invalidInventory("A remembered cloud computer no longer has its MausNest owner name — repair it in boat.dev before continuing");
         }
         continue;
       }
@@ -538,7 +538,7 @@ export async function listManagedBoats(
         inspected.identity.name !== namedOwner.currentName
         && inspected.identity.name !== namedOwner.legacyName
       ) {
-        return invalidInventory("A remembered cloud computer no longer has its OpenMausBot owner name — repair it in boat.dev before continuing");
+        return invalidInventory("A remembered cloud computer no longer has its MausNest owner name — repair it in boat.dev before continuing");
       }
       const directCandidate = {
         id: inspected.identity.boxId,
@@ -552,7 +552,7 @@ export async function listManagedBoats(
     try {
       deletions = boatDeletionSnapshot();
     } catch {
-      return invalidInventory("OpenMausBot could not safely read its cloud computer deletion records");
+      return invalidInventory("MausNest could not safely read its cloud computer deletion records");
     }
     for (const deletion of deletions) {
       let state: BoatDeletionReconciliation;
@@ -652,7 +652,7 @@ export async function listManagedBoats(
       try {
         adoptResolvedBoat(owner.botId, boxId);
       } catch {
-        return invalidInventory("OpenMausBot could not safely remember this legacy cloud computer's owner — repair it in boat.dev before continuing");
+        return invalidInventory("MausNest could not safely remember this legacy cloud computer's owner — repair it in boat.dev before continuing");
       }
     }
     seenBoatIds.add(boxId);
@@ -924,7 +924,7 @@ export async function verifyToken(token: string): Promise<{ ok: true } | { ok: f
 }
 
 const INCLUDED_BOAT_UNAVAILABLE = "The cloud computers included with your Cloud plan aren't available right now. Try again later.";
-const boatServiceName = (included: boolean) => included ? "MausBot Cloud's computer service" : "boat.dev";
+const boatServiceName = (included: boolean) => included ? "MausNest Cloud's computer service" : "boat.dev";
 
 export function boatErrorMessage(status: number, what: string, body?: any, included = false): string {
   const theirs = typeof body?.message === "string" ? body.message.trim() : "";

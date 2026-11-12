@@ -45,7 +45,7 @@ describe("the server and the credential", () => {
 
   it("refuses control-omb's changes on a server it merely found", async () => {
     await expect(openClient({}, { env: {}, requireExplicitForMutations: true }, true))
-      .rejects.toMatchObject({ message: "mutating commands require an explicit OpenMausBot instance", exitCode: 2 });
+      .rejects.toMatchObject({ message: "mutating commands require an explicit MausNest instance", exitCode: 2 });
   });
 });
 

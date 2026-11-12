@@ -2073,7 +2073,7 @@ Expected: all green. Fix any failure where it comes from. Never update a golden 
 
 These need Omkar's treg token, entered by him in the app, never in a shell or a file. With the OMB2 build from Step 3:
   - Press Test in Settings → API keys. It should show "Works. $X left on treg." Confirm the figure matches `treg balance`. If `/auth/me` or the balance route refuses the `X-Treg-Token` header, fix `accountInfo`.
-  - Ask a switched-on bot: "Search X for posts mentioning MausBot this week." Confirm the posts and links are real.
+  - Ask a switched-on bot: "Search X for posts mentioning MausNest this week." Confirm the posts and links are real.
   - Ask it to run the same search with the `newestId` it got as `sinceId`. Confirm it returns no repeats. If `since_id:` breaks the query, the client-side filter alone must still return no repeats.
   - Temporarily paste a wrong token, then call `x_search`. The bot should say "treg rejected the token…". Look up an account that does not exist with `x_profile` and record how treg answers a full miss; adjust the not-found path if it is not `username: null`.
 

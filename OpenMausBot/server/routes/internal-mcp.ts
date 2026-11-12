@@ -319,7 +319,7 @@ function signIn(deps: Deps, name: string, server: StoredMcpServer, owner: Return
   const card = deps.requestSignIn(name, server);
   if ("error" in card) return card;
   say(deps, { action: "sign_in", name }, ["server.mcp.askedSignIn", { name }]);
-  return { status: 202, text: `A Sign in card for ${name} is now visible to the person. End this turn and wait; OpenMausBot resumes you when they finish.` };
+  return { status: 202, text: `A Sign in card for ${name} is now visible to the person. End this turn and wait; MausNest resumes you when they finish.` };
 }
 
 async function signOut(deps: Deps, name: string, server: StoredMcpServer): Promise<Outcome> {

@@ -61,7 +61,7 @@ export function eventBlock(trigger: Pick<AppTrigger, "appName" | "eventName" | "
     `Received: ${new Date(event.receivedAt).toISOString()}`,
     `Event ID: ${event.id.slice(0, 200)}`,
   ].join("   ");
-  const test = event.test ? "\nTEST EVENT, started from OpenMausBot: nothing really happened. Do not reply to, send or change anything; say what you would do." : "";
+  const test = event.test ? "\nTEST EVENT, started from MausNest: nothing really happened. Do not reply to, send or change anything; say what you would do." : "";
   return [fromNote(appEventWho(trigger.appName, trigger.eventName), "event", AUTHORITY.info), BLOCK_OPEN, `${defused(header)}${test}`, "", defused(text), BLOCK_CLOSE].join("\n");
 }
 

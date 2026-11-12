@@ -14,7 +14,7 @@ const state = { status: "connected", teams: [
   { id: "team-waiting", name: "Waiting", machine: { origin: OTHER, status: "provisioning" } },
 ] };
 const BOTS = [
-  { id: "maus-bot-1", name: "MausBot", defaultBot: {} },
+  { id: "maus-bot-1", name: "MausNest", defaultBot: {} },
   { id: "atlas-bot-1", name: "Atlas" },
   { id: "chief-bot-1", name: "Luna", chiefOfStaff: true },
   { id: "old-bot-01", name: "Hidden", hidden: true },
@@ -49,7 +49,7 @@ test("lists My Cloud's bots to that team's own page, each with why it can't go, 
   try {
     const list = handlers.get("cloud-send:team-bring");
     assert.deepEqual(await list(OWN), { team: { id: "team-acme", name: "Acme", ready: true }, bots: [
-      { id: "maus-bot-1", name: "MausBot", stays: "default" }, { id: "atlas-bot-1", name: "Atlas" }, { id: "chief-bot-1", name: "Luna", stays: "chief" },
+      { id: "maus-bot-1", name: "MausNest", stays: "default" }, { id: "atlas-bot-1", name: "Atlas" }, { id: "chief-bot-1", name: "Luna", stays: "chief" },
     ] });
     assert.deepEqual(await list({ origin: "https://stranger.example.test" }), { bots: [] }, "a page that isn't one of the person's teams");
     assert.deepEqual(await list({}), { bots: [] }, "a sender that isn't the window's own page");
@@ -80,7 +80,7 @@ test("moves nothing until the person agrees in main's own confirm, which says th
     assert.equal(journal.value, null);
     assert.equal(asked[0].message, "Move Atlas to Acme?");
     assert.match(asked[0].detail, /no way back/);
-    assert.match(asked[0].detail, /what Atlas remembers, your connections, and MausBot/);
+    assert.match(asked[0].detail, /what Atlas remembers, your connections, and MausNest/);
     assert.deepEqual(asked[0].buttons, ["Move to Acme", "Cancel"]);
   } finally { done(); }
 });

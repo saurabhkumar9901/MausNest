@@ -7,7 +7,7 @@ import { addressClass, listed, ownAddresses, type AddressClass } from "../../../
 
 export { addressClass, ownAddresses, type AddressClass };
 
-/** `desktop`: the app on someone's computer. `server`: self-hosted (Docker, npm). `cloud`: a MausBot Cloud home. */
+/** `desktop`: the app on someone's computer. `server`: self-hosted (Docker, npm). `cloud`: a MausNest Cloud home. */
 export type EgressHost = "desktop" | "server" | "cloud";
 
 /** `home-network` and `port` come from the person's own computer when My Cloud's browsing goes out through it. */
@@ -42,13 +42,13 @@ export function namesThisMachine(host: string): boolean {
 export const browserEgressConfigSchema = z.object({
   /** Self-hosted servers only: local-network or this-computer destinations bots' browsers may reach, as
    * `10.0.0.5`, `192.168.1.0/24`, `10.0.0.5:8080`, `fd12::/48` or `[fd12::1]:443`. OpenMausBot's own ports,
-   * cloud metadata and link-local addresses stay closed. MausBot Cloud ignores it. */
+   * cloud metadata and link-local addresses stay closed. MausNest Cloud ignores it. */
   allow: z.array(z.string().trim().max(64).refine((entry) => parseAllowEntry(entry) !== null, {
     message: "must be an IP address or CIDR range, with an optional :port",
   })).max(64).optional(),
   /** Desktop: false keeps bots' browsers off the local network (the default lets them reach it). Self-hosted
    * servers: true lets them open this server's own sites and its local network (off by default); OpenMausBot's
-   * own ports, cloud metadata and link-local addresses stay closed. MausBot Cloud ignores it. */
+   * own ports, cloud metadata and link-local addresses stay closed. MausNest Cloud ignores it. */
   localNetwork: z.boolean().optional(),
 });
 export type BrowserEgressConfig = z.output<typeof browserEgressConfigSchema>;

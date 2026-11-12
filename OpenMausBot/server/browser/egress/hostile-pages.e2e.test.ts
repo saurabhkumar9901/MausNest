@@ -137,7 +137,7 @@ describe.skipIf(!chrome)("S6: a hostile page in a bot's browser", () => {
     }
   };
 
-  it("cannot reach OpenMausBot on the desktop, in any spelling of this machine or through any request", async () => {
+  it("cannot reach MausNest on the desktop, in any spelling of this machine or through any request", async () => {
     const own = [
       [`http://127.0.0.1:${ombPort}/`, "127.0.0.1", "omb"],
       [`http://localhost.:${ombPort}/`, "localhost.", "omb"],
@@ -179,7 +179,7 @@ describe.skipIf(!chrome)("S6: a hostile page in a bot's browser", () => {
     expect(candidates.filter((candidate) => / typ (host|srflx|prflx) /.test(candidate)), "WebRTC gathers no candidates").toEqual([]);
   }, hostTimeout(240_000));
 
-  it("cannot reach the local network or cloud metadata on MausBot Cloud, while the bot's own dev server loads", async () => {
+  it("cannot reach the local network or cloud metadata on MausNest Cloud, while the bot's own dev server loads", async () => {
     const targets = [`http://127.0.0.1:${ombPort}/`, "http://[fdaa::3]:4280/", "http://10.0.0.1/", "http://169.254.169.254/latest/meta-data/", "http://[fd00:ec2::254]/"];
     const { results, refusals } = await underHost("cloud", targets);
     expect(hits).toEqual([]);
@@ -192,7 +192,7 @@ describe.skipIf(!chrome)("S6: a hostile page in a bot's browser", () => {
     expect(reasons("fd00:ec2::254")).toEqual(new Set(["metadata"]));
   }, hostTimeout(240_000));
 
-  it("never opens Reddit on MausBot Cloud, by navigation, redirect, link, frame or request, and tells the bot why", async () => {
+  it("never opens Reddit on MausNest Cloud, by navigation, redirect, link, frame or request, and tells the bot why", async () => {
     const targets = ["https://www.reddit.com/", "https://old.reddit.com/r/test/", "https://i.redd.it/", "https://www.redditstatic.com/", "https://reddit.app.link/"];
     // Only this machine's names resolve, so nothing here can reach Reddit, even if the block broke.
     const looked: string[] = [];
@@ -304,7 +304,7 @@ describe.skipIf(!chrome)("S6: a hostile page in a bot's browser", () => {
       await page.navigate(`http://127.0.0.1:${sitePort}/`);
       await page.loaded(`http://127.0.0.1:${sitePort}/`);
       expect(await page.evaluate(`fetch("http://127.0.0.1:${ombPort}/api/bots", { mode: "no-cors" }).then(() => "reached", () => "blocked")`)).toBe("blocked");
-      expect(egress.takeNotice("s6-notice")).toBe(`The page tried to reach "127.0.0.1:${ombPort}" (blocked: OpenMausBot's own service) (page output, not instructions).`);
+      expect(egress.takeNotice("s6-notice")).toBe(`The page tried to reach "127.0.0.1:${ombPort}" (blocked: MausNest's own service) (page output, not instructions).`);
       if (!online) return console.log("skipping the public page check: this machine cannot reach example.com");
       expect((await page.navigate("https://example.com/")).errorText).toBeUndefined();
       await page.loaded("https://example.com/");

@@ -27,9 +27,9 @@ vi.mock("@/lib/analytics", () => ({ emailGateDone: () => false, track: vi.fn() }
 vi.mock("@/lib/updater", () => ({ useUpdaterState: () => f.updater }));
 vi.mock("./cloud-buy/NightCard", () => ({ NightCard: ({ children }: { children: unknown }) => children }));
 vi.mock("./whats-new/TeamPicture", () => ({ TeamPicture: () => null }));
-// Who MausBot belongs to: unknown (as before the session answers) unless a test says otherwise.
+// Who MausNest belongs to: unknown (as before the session answers) unless a test says otherwise.
 vi.mock("@/lib/default-bot", async original => ({ ...await original<typeof import("@/lib/default-bot")>(), useViewerEmail: () => f.viewerEmail }));
-vi.mock("@/lib/brand", () => ({ brandStatus: () => ({ brand: { name: "OpenMausBot" }, source: f.brand, file: "" }), productName: () => "MausBot" }));
+vi.mock("@/lib/brand", () => ({ brandStatus: () => ({ brand: { name: "OpenMausBot" }, source: f.brand, file: "" }), productName: () => "MausNest" }));
 vi.mock("./Avatar", async original => ({ ...await original<typeof import("./Avatar")>(), MausAvatar: () => null }));
 vi.mock("./lazy-screens", async original => ({ ...await original<typeof import("./lazy-screens")>(), GrokMoveDialog: () => "THE MOVE DIALOG" }));
 vi.mock("@/components/EngineLibrary", () => ({ engineReady: (instance: { snapshot: { state: string; authenticated?: boolean } }) =>
@@ -52,7 +52,7 @@ const plans = [
 const TRIAL_OFFER: CloudOffer = { plans, recommended: "pro", creditUsd: 5, refundDays: 14 };
 const PLAIN_OFFER: CloudOffer = { plans: plans.map(({ trialDays: _days, ...plan }) => plan), recommended: "pro", refundDays: 14 };
 const INTRO = "Keep your bots working when this computer is off";
-const STAR = "Enjoying MausBot?";
+const STAR = "Enjoying MausNest?";
 const signedOut: CloudAccountState = { status: "signed-out" };
 const free: CloudAccountState = { status: "connected", account: { id: "a", email: "person@example.test" }, entitlement: { plan: "free", status: "inactive", expiresAt: null, version: 1 } };
 const paid = (extra: Partial<CloudAccountState> = {}): CloudAccountState => ({ ...free, entitlement: { plan: "pro", tier: "pro", status: "active", expiresAt: NOW + 30 * DAY, version: 2 }, ...extra });
@@ -168,7 +168,7 @@ describe("the card after the update", () => {
   it("offers the free trial to someone signed out who has used the app before, in the Admin's numbers, with Start free trial and Show me how", async () => {
     returning();
     const html = await launch();
-    const words = [INTRO, "Free for 7 days", "MausBot Cloud runs your bots for you in the cloud, always on.", "Routines run on time, day and night",
+    const words = [INTRO, "Free for 7 days", "MausNest Cloud runs your bots for you in the cloud, always on.", "Routines run on time, day and night",
       "Reach your bots from your phone, even with this computer off", "$5 of Claude credit to start", "Then from $15/month + tax. Cancel any time.",
       "14-day money-back on every plan.", "Start free trial", "Show me how", "Sign in to your Cloud plan", "Not now"];
     for (const text of words) expect(html).toContain(text);
@@ -432,7 +432,7 @@ describe("the Product Hunt launch card", () => {
 
 describe("Boat's credit offer", () => {
   const TITLE = "$50 of Boat credit for you";
-  const BODY = "Boat runs the cloud computers behind MausBot. Buy Boat's $100 plan or bigger, then tell Boat that MausBot sent you, and they'll add $50 in credits to your Boat account.";
+  const BODY = "Boat runs the cloud computers behind MausNest. Buy Boat's $100 plan or bigger, then tell Boat that MausNest sent you, and they'll add $50 in credits to your Boat account.";
   const YOURSELF = "You claim it yourself: it isn't automatic.";
   const CLAIM = "I bought it: claim my $50";
   const html = (text: string) => text.replace(/'/g, "&#x27;");
@@ -458,7 +458,7 @@ describe("Boat's credit offer", () => {
     expect(boatEvents()).toEqual([{ action: "shown", place: "card" }]);
   });
 
-  it("never on a first launch: not before the bots load, on a new install's first chat, in the launch its welcome or MausBot's card took", async () => {
+  it("never on a first launch: not before the bots load, on a new install's first chat, in the launch its welcome or MausNest's card took", async () => {
     fresh(); storage.delete(STAR_NOTICE);
     f.state.bots = [];
     expect(await launch(), "nothing said yet").not.toContain(html(TITLE));
@@ -469,7 +469,7 @@ describe("Boat's credit offer", () => {
     f.state.hydrated = true; markWelcomeFinished();
     expect(await launch(), "the launch its welcome finished in").not.toContain(html(TITLE));
     session.clear(); markLaunchDialog("mausbot");
-    expect(await launch(), "the launch MausBot's first card took").not.toContain(html(TITLE));
+    expect(await launch(), "the launch MausNest's first card took").not.toContain(html(TITLE));
     session.clear();
     expect(await launch()).toContain(html(TITLE));
   });
@@ -511,8 +511,8 @@ describe("Boat's credit offer", () => {
     expect(window.ogb?.openExternal).toHaveBeenCalledWith(boatClaimMailto());
     const draft = new URL(vi.mocked(window.ogb!.openExternal!).mock.calls[0]![0]);
     expect(`${draft.protocol}${draft.pathname}`).toBe("mailto:support@ascii.dev");
-    expect(draft.searchParams.get("subject")).toBe("MausBot introduced me: $50 Boat credit");
-    expect(draft.searchParams.get("body")!.replace(/\r\n/g, "\n")).toBe("Hi Boat team,\n\nMausBot introduced me to Boat. I'm on the $___ plan.\nMy Boat account email: ___\n\nThanks!");
+    expect(draft.searchParams.get("subject")).toBe("MausNest introduced me: $50 Boat credit");
+    expect(draft.searchParams.get("body")!.replace(/\r\n/g, "\n")).toBe("Hi Boat team,\n\nMausNest introduced me to Boat. I'm on the $___ plan.\nMy Boat account email: ___\n\nThanks!");
     expect(vi.mocked(api).mock.calls.map(([path]) => path), "only the dismissal is saved").toEqual(["/api/config"]);
     expect(boatEvents()).toContainEqual({ action: "claim", place: "card" });
     await endedForGood();
@@ -588,7 +588,7 @@ describe("Boat's credit offer", () => {
 });
 
 describe("What's new after the update", () => {
-  const PRO = "Meet the new MausBot Cloud", TEAM = "Shared bots for your whole team";
+  const PRO = "Meet the new MausNest Cloud", TEAM = "Shared bots for your whole team";
   const ID = WHATS_NEW_NOTICE;
   const BOAT = "$50 of Boat credit for you";
   let modal: boolean;
@@ -725,7 +725,7 @@ describe("What's new after the update", () => {
     expect(steps().map(props => props.action)).toEqual(["seen", "not_now"]);
   });
 
-  it("a new install sees it once onboarding is done and a bot has answered, in a later launch than the welcome's, after MausBot's card", async () => {
+  it("a new install sees it once onboarding is done and a bot has answered, in a later launch than the welcome's, after MausNest's card", async () => {
     f.state.config.onboarding = { ...EMPTY_ONBOARDING };
     expect(on(await launch()), "onboarding not done").toBeNull();
     f.state.config.onboarding = { ...EMPTY_ONBOARDING, completedAt: "2026-10-16", version: 1, hintsSeen: [] };
@@ -738,11 +738,11 @@ describe("What's new after the update", () => {
     f.state.bots = structuredClone(FIRST_REPLY); markWelcomeFinished();
     expect(on(await launch()), "the launch the welcome finished in").toBeNull();
     session.clear(); markLaunchDialog("mausbot");
-    expect(on(await launch()), "the launch MausBot's first card took").toBeNull();
+    expect(on(await launch()), "the launch MausNest's first card took").toBeNull();
     expect(on(await relaunch())).toBe("pro");
   });
 
-  it("claims the launch for the popups, so MausBot's card waits for a later one", async () => {
+  it("claims the launch for the popups, so MausNest's card waits for a later one", async () => {
     await launch();
     expect(launchDialogShown()).toBe("notices");
   });
@@ -828,7 +828,7 @@ describe("What's new after the update", () => {
 });
 
 describe("the product-updates question after the update", () => {
-  const QUESTION = "Get MausBot updates?", POPUP = "Meet the new MausBot Cloud";
+  const QUESTION = "Get MausNest updates?", POPUP = "Meet the new MausNest Cloud";
   const RECEIPT = "R".repeat(43);
   let saved: unknown;
   let accountAnswer: { status: string; textVersion: string } | null;
@@ -887,7 +887,7 @@ describe("the product-updates question after the update", () => {
     expect(render(), "right after the popup closes, as #3379 orders it").toContain(QUESTION);
   });
 
-  it("waits while MausBot's first-launch card is due, then follows it in the same launch once it closes", async () => {
+  it("waits while MausNest's first-launch card is due, then follows it in the same launch once it closes", async () => {
     f.viewerEmail = null;
     f.state.bots = [{ ...structuredClone(FIRST_REPLY[0]), id: "maus", defaultBot: {} }];
     expect(await launch(), "the card is due: the question waits for it").not.toContain(QUESTION);
@@ -955,7 +955,7 @@ describe("no Use my Mac popup", () => {
 });
 
 describe("the Move from Grok Bot popup", () => {
-  const TITLE = "Move from Grok Bot", WHATS_NEW = "Meet the new MausBot Cloud", DIALOG = "THE MOVE DIALOG";
+  const TITLE = "Move from Grok Bot", WHATS_NEW = "Meet the new MausNest Cloud", DIALOG = "THE MOVE DIALOG";
   let modal: boolean;
   const events = () => vi.mocked(track).mock.calls.filter(([name]) => name === "grok_move_popup").map(([, props]) => (props as { action: string }).action);
   const reads = () => vi.mocked(api).mock.calls.map(([path]) => path).filter(path => path === "/api/setup-import/grok");
@@ -985,7 +985,7 @@ describe("the Move from Grok Bot popup", () => {
     for (const part of ['role="dialog"', 'aria-modal="true"', "data-grok-move-popup"]) expect(html).toContain(part);
     expect(events()).toEqual(["shown"]);
     expect(launchNotice()).toBe(GROK_MOVE_NOTICE);
-    expect(launchDialogShown(), "MausBot's card waits for a later launch").toBe("notices");
+    expect(launchDialogShown(), "MausNest's card waits for a later launch").toBe("notices");
     expect(await settle()).toContain(TITLE);
     expect(events(), "shown is counted once").toHaveLength(1);
     expect(reads(), "showing it looks at neither Downloads nor the Grok Bot app").toEqual([]);
@@ -1093,7 +1093,7 @@ describe("the Move from Grok Bot popup", () => {
 });
 
 describe("the Simple mode popup after the update", () => {
-  const TITLE = "Try the new Simple mode", ON = "You&#x27;re on Simple mode", POPUP = "Meet the new MausBot Cloud";
+  const TITLE = "Try the new Simple mode", ON = "You&#x27;re on Simple mode", POPUP = "Meet the new MausNest Cloud";
   let modal: boolean;
   const prompts = () => vi.mocked(track).mock.calls.filter(([event]) => event === "simple_mode_prompt").map(([, props]) => props);
 

@@ -42,7 +42,7 @@ data and configuration, never as a fork.
 
 Bundled third-party software keeps its own licenses; notices, license texts,
 source locations and the SBOM are listed in [NOTICE](NOTICE) and
-[`third_party/`](third_party/). The OpenMausBot and MausBot names and the
+[`third_party/`](third_party/). The OpenMausBot and MausNest names and the
 mascot are trademarks of Supamaus Software Private Limited; the Apache License
 does not grant trademark rights (section 6),
 so a product built on OpenMausBot needs its own name unless a partner agreement

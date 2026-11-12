@@ -40,7 +40,7 @@ test("inherited Object names are not install commands", () => {
 test("a staged path that is gone is not used", () => {
   const workspace = mkdtempSync(join(tmpdir(), "omb-staged-"));
   try {
-    const present = join(workspace, "OpenMausBot.deb");
+    const present = join(workspace, "MausNest.deb");
     writeFileSync(present, "x");
     const missing = join(workspace, "gone.deb");
 

@@ -151,7 +151,7 @@ export function namesTeammate(target: Pick<RosterMember, "id" | "name">, raw: st
 /** Their audiences alone would let `from` reach `target`, whatever its own list of peers says. */
 export const reachesInAudience = (from: RosterMember, target: RosterMember): boolean => sameAudience(from.visibility, target.visibility);
 
-/** The teammate `raw` names when `from` may not reach it. A person's own MausBot is never named to anyone else. */
+/** The teammate `raw` names when `from` may not reach it. A person's own MausNest is never named to anyone else. */
 export function unreachableTeammate<T extends RosterMember>(bots: readonly T[], from: RosterMember, raw: string): T | null {
   const target = bots.find((bot) => bot.id === raw.trim()) ?? bots.find((bot) => namesTeammate(bot, raw));
   return target && target.id !== from.id && !target.hidden && !target.defaultBot && !canReach(from, target) ? target : null;

@@ -348,7 +348,7 @@ function warn(release: StandaloneRelease, detail: unknown): void {
 }
 
 function httpRefusal(name: string, status: number): StandaloneInstallError {
-  if (status === 404 || status === 410) return new StandaloneInstallError(`This version of ${name} is no longer available to download. Update OpenMausBot, then try again.`);
+  if (status === 404 || status === 410) return new StandaloneInstallError(`This version of ${name} is no longer available to download. Update MausNest, then try again.`);
   if (status === 403 || status === 429) return new StandaloneInstallError(`The download site is limiting downloads right now. Try again in a few minutes.`);
   if (status >= 500) return new StandaloneInstallError(`${name}'s download site isn't answering right now. Try again later.`);
   return new StandaloneInstallError(`${name} couldn't be downloaded. Check the internet connection and try again.`);
@@ -671,7 +671,7 @@ export function plainInstallError(release: StandaloneRelease, asset: StandaloneA
     return new StandaloneInstallError(`${release.name} is open in another window. Close it, then try again.`);
   }
   if (code === "EACCES" || code === "EPERM" || code === "EROFS") {
-    return new StandaloneInstallError(`OpenMausBot can't write to its folder for ${release.name}. Check the folder's permissions, then try again.`);
+    return new StandaloneInstallError(`MausNest can't write to its folder for ${release.name}. Check the folder's permissions, then try again.`);
   }
   return new StandaloneInstallError(`${release.name} couldn't be installed. Try again.`);
 }

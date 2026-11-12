@@ -410,7 +410,7 @@ describe("a Team Cloud's audiences", () => {
     const ownMain = { ...bot, threadId: "t-pub-2", mainThreadId: "t-pub-2" };
     expect((memberBot(ownMain, ada) as { tasks: Array<{ title: string }> }).tasks[1]!.title, "a private chat is never the shared one").toBe("New thread");
     const ownHelper = { ...bot, defaultBot: { person: "ada@x.test" } };
-    expect((memberBot(ownHelper, ada) as { tasks: Array<{ title: string }> }).tasks[0]!.title, "a member's own MausBot shares nothing").toBe("Rooms today: 12");
+    expect((memberBot(ownHelper, ada) as { tasks: Array<{ title: string }> }).tasks[0]!.title, "a member's own MausNest shares nothing").toBe("Rooms today: 12");
     const offTeam = new VisibleSet(open, openGroups, ADA);
     expect((memberBot(bot, offTeam) as { tasks: Array<{ title: string }> }).tasks[0]!.title, "off a team nothing changes").toBe("Rooms today: 12");
   });
