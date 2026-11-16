@@ -1,6 +1,6 @@
 appId: com.openmausbot.app
 productName: MausNest
-artifactName: OpenMausBot-${version}-${arch}.${ext}
+artifactName: MausNest-${version}-${arch}.${ext}
 
 protocols:
   - name: MausNest package install
@@ -145,7 +145,7 @@ dmg:
   # ${arch} is load-bearing: without it the x64 dmg silently overwrites
   # the arm64 one when both arches build (this section overrides both the
   # top-level and mac-level artifactName, so it must carry the arch itself)
-  artifactName: OpenMausBot-${version}-${arch}.dmg
+  artifactName: MausNest-${version}-${arch}.dmg
   # x/y are icon centres in points. electron-builder 26.15.3 sizes the window
   # from build/background.png and ignores dmg.window whenever a background is set.
   iconSize: 112
@@ -196,7 +196,7 @@ nsis:
   # Versioned, like the .dmg. The README's /latest/download/ button needs a
   # STABLE filename, so ship a second copy named OpenMausBot-setup.exe on the
   # release — the same trick as OpenMausBot.dmg beside OpenMausBot-${version}.dmg.
-  artifactName: OpenMausBot-${version}-setup.${ext}
+  artifactName: MausNest-${version}-setup.${ext}
 
 linux:
   target:
