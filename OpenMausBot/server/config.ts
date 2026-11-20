@@ -736,6 +736,20 @@ export function changedInstanceIds(before: Record<string, unknown>, after: Recor
 
 export const DATA_DIR = process.env.OMB_DATA_DIR ?? join(homedir(), ".openmausbot");
 const LEGACY_DATA_DIR = join(homedir(), ".opengrokbot");
+
+// Optional .env files: a repo-root .env for dev/CLI use and a per-user .env next to
+// config.json for the packaged app. process.loadEnvFile never overrides a variable that is
+// already in process.env, so the desktop shell's injected credentials always win.
+const loadedEnvFiles = new Set<string>();
+for (const file of [join(DATA_DIR, ".env"), join(process.cwd(), ".env")]) {
+  if (loadedEnvFiles.has(file) || !existsSync(file)) continue;
+  loadedEnvFiles.add(file);
+  try {
+    process.loadEnvFile(file);
+  } catch {
+    // A malformed .env must not prevent startup; credentials simply stay unset.
+  }
+}
 export const EVENTS_DIR = join(DATA_DIR, "events");
 export const NATIVE_DIR = join(DATA_DIR, "native");
 

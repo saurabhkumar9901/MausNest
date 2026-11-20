@@ -69,3 +69,4 @@ CLAUDE.local.md
 
 # Playwright MCP artifacts
 .playwright-mcp/
+graphify-out
